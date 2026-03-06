@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "run_alphafold3"
+version = "0.0.1"
+authors = [
+  { name = "Andrey Rozenberg", email = "alephreish@gmail.com" }
+]
+description = "AlphaFold3 wrapper"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "gemmi==0.7.3",
+    "tqdm==4.67.2",
+    "biopython==1.85"
+]
+[project.urls]
+"Homepage" = "https://github.com/BejaLab/run_alphafold3"
+"Bug Tracker" = "https://github.com/BejaLab/run_alphafold3/issues"
+
+[project.scripts]
+alphafold3_init = "run_alphafold3:init_cli"
+alphafold3_run = "run_alphafold3:run_cli"
+alphafold3_select = "run_alphafold3:select_cli"
