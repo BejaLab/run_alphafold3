@@ -28,4 +28,4 @@ dependencies = [
 [project.scripts]
 alphafold3_init = "run_alphafold3:init_cli"
 alphafold3_run = "run_alphafold3:run_cli"
-alphafold3_select = "run_alphafold3:select_cli"
+alphafold3_complex = "run_alphafold3:complex_cli"

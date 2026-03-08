@@ -12,6 +12,8 @@ import queue
 import subprocess
 from contextlib import contextmanager
 import json
+import string
+import itertools as it
 
 # --- Constants ---
 NUM_SAMPLES = 5
@@ -30,14 +32,15 @@ def get_log(log_path):
     finally:
         f.close()
 
-def get_data_paths(data_dir, create = False):
+def get_data_paths(data_dir, model_dir = None, public_dir = None, create = False):
     data_path = Path(data_dir).resolve()
     if create and not data_path.exists():
         data_path.mkdir(parents = True, exist_ok = True)
-    model_path = (data_path / "models").resolve()
     db_path = data_path / "predictions.sq3"
-    public_path = (data_path / "public_databases").resolve()
-    return model_path, public_path, db_path
+    model_path = Path(model_dir).resolve() if model_dir else data_path / "models"
+    public_path = Path(public_dir).resolve() if public_dir else data_path / "public_databases"
+
+    return db_path, model_path, public_path
 
 def fetch_pred(conn, json_hash, seed, sample):
     found = conn.execute("SELECT cif, summary, confidences FROM predictions WHERE json_hash = ? AND seed = ? AND sample = ?", (json_hash, str(seed), str(sample))).fetchone()
@@ -52,7 +55,7 @@ def get_results_dir_path(prefix_path, stem, seed, sample, create = False):
 def get_results_files_paths(path):
     return path / "model.cif", path / "summary_confidences.json", path / "confidences.json"
 
-def launch_run(input, output_dir, data_dir, log_file, seeds, gpus, max_len):
+def launch_run(input, output_dir, data_dir, model_dir, log_file, seeds, gpus, max_len):
 
     if not isinstance(input, list):
         input = [ input ]
@@ -64,7 +67,13 @@ def launch_run(input, output_dir, data_dir, log_file, seeds, gpus, max_len):
     if not input:
         error("No input files supplied", fatal = True)
 
-    model_path, public_path, db_path = get_data_paths(data_dir)
+    db_path, model_path, *rest = get_data_paths(data_dir, model_dir)
+
+    if not db_path.exists():
+        error(f"Database at {db_path} does not exist", fatal = True)
+    if not model_path.exists():
+        error(f"No models at {model_path}", fatal = True)
+
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents = True, exist_ok = True)
     json_paths = {}
@@ -80,16 +89,13 @@ def launch_run(input, output_dir, data_dir, log_file, seeds, gpus, max_len):
     for gpu in gpus:
         gpu_queue.put(gpu)
 
-    conn_queue = queue.Queue()
-    conn_queue.put(1)
-
     def process_files(conn):
         for json_stem, json_path in json_paths.items():
             try:
                 data = AF3json(json_path, seeds)
             except Exception as e:
                 error(f"Could not parse {json_path}: {e}", fatal = True)
-            if data.get_len() > max_len:
+            if len(data) > max_len:
                 error(f"{json_path} has a total length of {data.len} > {max_data_len}")
             json_hash = data.get_hash()
             missing = set()
@@ -110,7 +116,7 @@ def launch_run(input, output_dir, data_dir, log_file, seeds, gpus, max_len):
     def wrapper(data, missing_seeds, log):
         gpu = gpu_queue.get()
         try:
-            return run_gpu_worker(data, output_path, data_dir, gpu, missing_seeds, log)
+            return run_gpu_worker(data, output_path, model_path, gpu, missing_seeds, log)
         except Exception as e:
             error(f"Got exception: {e}")
         finally:
@@ -174,16 +180,14 @@ class JSONpath(Path):
         return self.suffix.lower() == ".json"
 
 class AF3json:
-    def __init__(self, path: JSONpath, seeds: set[int]):
+    def __init__(self, path: JSONpath, oligomer = 1, seeds: set[int] = set()):
         self.path = path
         self.name = path.stem
         self.data = path.read_json()
         if 'sequences' not in self.data:
             raise ValueError("No 'sequences' found in json")
-        self.orig_seeds = self.data.pop('modelSeeds')
+        self.orig_seeds = self.data.pop('modelSeeds', [])
         self.seeds = list(seeds) if seeds else self.orig_seeds
-        if not self.seeds:
-            raise ValueError("No seeds supplied")
         self.orig_name = self.data.pop('name')
         if 'dialect' not in self.data:
             self.data['dialect'] = "alphafold3"
@@ -194,20 +198,27 @@ class AF3json:
         elif self.data['version'] != 1:
             raise ValueError("Only version 1 is supported")
         self.len = self.hash = None
+        self.ids = AF3json.id_gen()
+        self.len = 0
+        for seq in self.data['sequences']:
+            for item in seq:
+                id = seq[item].get('id', [])
+                seq[item]['id'] = list(it.islice(self.ids, oligomer * len(id)))
+                if item == 'protein':
+                    self.len += len(id) * len(seq[item]['sequence'])
+        ccd_str = self.data.pop('userCCD', "")
+        self.ccd = {}
+        ccd_name = None
+        for line in ccd_str.split('\n'):
+            if line.startswith('data_'):
+                ccd_name = line
+                self.ccd[ccd_name] = [ line ]
+            elif ccd_name:
+                self.ccd[ccd_name].append(line)
+            elif line:
+                raise ValueError("Found non-empty 'userCCD' but no data_* line")
 
-    def get_len(self):
-        if not self.len:
-            self.len = 0
-            for seq in self.data['sequences']:
-                if 'protein' in seq:
-                    protein = seq['protein']
-                    if 'id' not in protein:
-                        protein['id'] = [ "A" ]
-                    elif not isinstance(protein['id'], list):
-                        protein['id'] = [ protein['id'] ]
-                    self.len += len(protein['sequence']) * len(protein['id'])
-        if not self.len:
-            raise ValueError("No protein sequences found in json")
+    def __len__(self):
         return self.len
 
     def get_hash(self):
@@ -221,7 +232,33 @@ class AF3json:
         data = self.data.copy()
         data['modelSeeds'] = self.seeds
         data['name'] = 'query'
+        if self.ccd:
+            data['userCCD'] = ''
+            for ccd_name, ccd_lines in self.ccd.items():
+                data['userCCD'] += '\n'.join(ccd_lines) + '\n'
         path.write_json(data)
+
+    @staticmethod
+    def id_gen():
+        letters = string.ascii_uppercase
+        for let in letters:
+            yield let
+        for size in it.count(2):
+            for p in it.product(letters, repeat = size):
+                yield "".join(p)
+
+    def __add__(self, other):
+        if not isinstance(other, AF3json):
+            return NotImplemented
+        for seq in other.data['sequences']:
+            for item in seq:
+                id = seq[item].get('id', [])
+                seq[item]['id'] = list(it.islice(self.ids, len(id)))
+            self.data['sequences'].append(seq)
+        for ccd_name, ccd_lines in other.ccd.items():
+            if ccd_name not in self.ccd:
+                self.ccd[ccf_name] = ccd_lines
+        return self
 
 def create_dummy_databases(path):
     public_path = path / "public_databases"
@@ -241,12 +278,10 @@ def create_dummy_databases(path):
         (public_path / db).touch()
     return public_path
 
-def run_gpu_worker(data, output_path, data_dir, gpu, seeds, log):
-
-    model_path, public_path, db_path = get_data_paths(data_dir)
+def run_gpu_worker(data, output_path, model_path, gpu, seeds, log):
 
     env = {}
-    long_query = data.get_len() >= 3500
+    long_query = len(data) >= 3500
     xla_preallocate = "false" if long_query else "true"
     unified_mem = "true" if long_query else ""
     mem_fraction = 3.20 if long_query else 0.95
@@ -289,8 +324,29 @@ def run_gpu_worker(data, output_path, data_dir, gpu, seeds, log):
             error("Error: Docker command failed. Check log file.")
     return output
 
+def launch_complex(input_files, output_file):
+    input_paths = []
+    for oligomer, input_file in input_files:
+        input_path = JSONpath(input_file)
+        if not input_path.exists():
+            error(f"{input_file} does not exist", fatal = True)
+        if not input_path.is_file() or not input_path.is_json():
+            error(f"{input_file} is not a json file", fatal = True)
+        input_paths.append((input_path, oligomer))
+    if not input_paths:
+        error("No input files provided", fatal = True)
+
+    input_path, oligomer = input_paths.pop()
+    output = AF3json(input_path, oligomer = oligomer)
+    for input_path, oligomer in input_paths:
+        output += AF3json(input_path, oligomer = oligomer)
+
+    output_path = JSONpath(output_file)
+    output_path.parent.mkdir(parents = True, exist_ok = True)
+    output.write(output_path)
+
 def launch_init(data_dir):
-    model_path, public_path, db_path = get_data_paths(data_dir, create = True)
+    db_path, *rest = get_data_paths(data_dir, create = True)
     print(f"[*] Initializing database at {db_path}")
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS predictions (json_hash TEXT, seed INT, sample INT, cif TEXT, summary TEXT, confidences TEXT, PRIMARY KEY (json_hash, seed, sample))")
@@ -303,14 +359,15 @@ def run_cli():
     parser = argparse.ArgumentParser(description = "AlphaFold3 wrapper: Run")
     parser.add_argument("-i", "--input", required = True, nargs = '+', help = "Path to input json file(s) or a directory containing them")
     parser.add_argument("-O", "--output", required = True, help = "Output directory")
-    parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
+    parser.add_argument("-D", "--data-dir", required = True, help = "Directory for database")
+    parser.add_argument("-m", "--model-dir", help = "Model directory (if not in {data_dir}/models)")
     parser.add_argument("-g", "--gpus", type = set_of_int_arg, default = [0], help = "GPU indices to use")
     parser.add_argument("--max-len", type = int, default = 5200, help = "Maximum total number of amino acid resudues (default: no)")
     parser.add_argument("-s", "--seeds", type = set_of_int_arg, help = "Seeds (overrides modelSeeds in json)")
     parser.add_argument("-l", "--log", type = str, help = "Raw log file")
     args = parser.parse_args()
     launch_run(
-        args.input, args.output, args.data_dir, args.log,
+        args.input, args.output, args.data_dir, args.model_dir, args.log,
         seeds = args.seeds, gpus = args.gpus, max_len = args.max_len
     )
 
@@ -328,3 +385,29 @@ def init_cli():
     parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
     args = parser.parse_args()
     launch_init(args.data_dir)
+
+def complex_cli():
+    class WeightedFileAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string = None):
+            items = getattr(namespace, self.dest, None) or []
+            # just the filename
+            if len(values) == 1:
+                weight = 1
+                filepath = values[0]
+            # weight then filename
+            elif len(values) == 2:
+                try:
+                    weight = int(values[0])
+                    filepath = values[1]
+                except ValueError:
+                    raise argparse.ArgumentError(self, f"Expected weight (number), got '{values[0]}'")
+            else:
+                raise argparse.ArgumentError(self, "Expected 1 or 2 arguments per -i flag")
+            items.append((weight, filepath))
+            setattr(namespace, self.dest, items)
+
+    parser = argparse.ArgumentParser(description = "AlphaFold3 wrapper: Create complex")
+    parser.add_argument("-i", "--input", required = True, nargs = '+', action = WeightedFileAction, metavar = ('N', 'FILE'), help = "Path to input json file(s) with optional number of chains (-i 3 input.json or -i input.json")
+    parser.add_argument("-O", "--output", required = True, help = "Output json file")
+    args = parser.parse_args()
+    launch_complex(args.input, args.output)
