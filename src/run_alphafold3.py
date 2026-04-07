@@ -16,11 +16,47 @@ import string
 import itertools as it
 import copy
 from urllib.parse import quote
+from .parse_hhr import read_hhr
 
 # --- Constants ---
 NUM_SAMPLES = 5
+ALT_ALNS = 10
 
 # --- Helper Functions ---
+
+def parse_mod_resources(selected_mods):
+    mods_dir = Path(pkg_resources.files('run_alphafold3.src.mods'))
+    metadata_path = mods_dir.joinpath('mods.csv')
+    
+    metadata = []
+    profile_paths = {}
+    cif_paths = {}
+    with open(metadata_path, 'r') as f:
+        for line in f:
+            profile, pos, res, mod, lig = line.rstrip().split(',')
+            if not selected_mods or mod in selected_mods:
+                cif_path = mods_dir / "cif" / (mod + '.cif')
+                a3m_path = mods_dir / "a3m" / (profile + '.a3m')
+                assert mod_path.is_file()
+                assert cif_path.is_file()
+                metadata.append({ 'profile': profile, 'pos': int(pos), 'res': res, 'mod': mod })
+                cif_paths[mod] = cif_path
+                a3m_paths[profile] = profile_path
+
+    if selected_mods:
+        for mod in selected_mods:
+            if mod not in cif_paths:
+                error(f"Modification {mod} is not supported")
+
+    return metadata, a3m_paths, cif_paths
+
+def load_metadata(txt_path: Path) -> list:
+    metadata = []
+    with open(txt_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            metadata.append(row)
+    return metadata
 
 @contextmanager
 def get_log(log_path):
@@ -191,7 +227,7 @@ def launch_search(input, output_dir, data_dir, log_file, workers, threads):
             ok = False
     if not ok:
         error("Something went wrong", fatal = True)
-    print(f"[✔] All done")
+    all_done()
 
 def launch_predict(input, output_dir, data_dir, log_file, seeds, gpus, max_len):
 
@@ -284,7 +320,7 @@ def launch_predict(input, output_dir, data_dir, log_file, seeds, gpus, max_len):
             ok = False
     if not ok:
         error("Something went wrong", fatal = True)
-    print(f"[✔] All done")
+    all_done()
 
 def error(msg, fatal = False):
     print(f"[✘] {msg}")
@@ -342,16 +378,19 @@ class AF3json:
                         seq[item]['unpairedMsa'] = ""
         ccd_str = self.data.pop('userCCD', None)
         self.ccd = {}
-        ccd_name = None
         if ccd_str:
-            for line in ccd_str.split('\n'):
-                if line.startswith('data_'):
-                    ccd_name = line
-                    self.ccd[ccd_name] = [ line ]
-                elif ccd_name:
-                    self.ccd[ccd_name].append(line)
-                elif line:
-                    raise ValueError("Found non-empty 'userCCD' but no data_* line")
+            self.add_ccd(ccd_str)
+
+    def add_ccd(self, ccd_str):
+        ccd_name = None
+        for line in ccd_str.split('\n'):
+            if line.startswith('data_'):
+                ccd_name = line
+                self.ccd[ccd_name] = [ line ]
+            elif ccd_name:
+                self.ccd[ccd_name].append(line)
+            elif line:
+                raise ValueError("Found non-empty 'userCCD' but no data_* line")
 
     def __len__(self):
         return self.len
@@ -458,7 +497,7 @@ def run_search_worker(seq_hash, sequence, public_path, threads, log):
                 seq = next(af3.iter_seq())
                 output = seq['unpairedMsa'], seq['templates']
         except subprocess.CalledProcessError:
-            error("Error: Docker command failed. Check log file.", fatal = True)
+            error("Docker command failed. Check log file.", fatal = True)
     return output
 
 def run_predict_worker(data, output_path, model_path, gpu, seeds, log):
@@ -534,7 +573,172 @@ def launch_init(data_dir):
         conn.execute("CREATE TABLE IF NOT EXISTS proteins (seq_hash TEXT PRIMARY KEY, seq TEXT UNIQUE NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS searches (seq_hash TEXT, unpaired_msa TEXT, templates TEXT, PRIMARY KEY (seq_hash))")
         conn.execute("CREATE TABLE IF NOT EXISTS predictions (json_hash TEXT, seed INT, sample INT, cif TEXT, summary TEXT, confidences TEXT, PRIMARY KEY (json_hash, seed, sample))")
-    print(f"[✔] Init complete")
+    all_done()
+
+def hh_mapping(hit, min_conf):
+    mapping = {}
+    
+    q_seq = hit['query']['alignment']
+    t_seq = hit['template']['alignment']
+    confs = hit['confidence']
+    
+    assert len(q_seq) == len(t_seq)
+    
+    q_pos = hit['query']['coords'][0]
+    t_pos = hit['template']['coords'][0]
+    
+    for q_char, t_char, conf in zip(q_seq, t_seq, confs):
+        if q_char != '-' and t_char != '-' and int(conf) >= min_conf:
+            mapping[t_pos] = q_pos
+        if q_char != '-':
+            q_pos += 1
+        if t_char != '-':
+            t_pos += 1
+    return mapping
+
+def add_ccd_data(af3_obj, mods_dir, modification: str):
+    cif_path = mods_dir.joinpath(f"{modification}.cif")
+    if not cif_path.is_file():
+        raise FileNotFoundError(f"CCD CIF file missing for modification: {modification}")
+        
+    lines = cif_path.read_text().splitlines()
+    
+    data_line = next((line for line in lines if line.startswith('data_')), None)
+    if not data_line:
+        raise ValueError(f"No 'data_' block found in {cif_path}")
+        
+    if data_line not in af3_obj.ccd:
+        af3_obj.ccd[data_line] = []
+        ccd_name = None
+        for line in lines:
+            if line.startswith('data_'):
+                ccd_name = line
+            if ccd_name:
+                af3_obj.ccd[ccd_name].append(line)
+
+def search_mod_worker(protein, metadata, a3m_paths, log, min_prob, min_conf):
+    output = {}
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dir_path = Path(temp_dir)
+        protein = seq_dict['protein']
+        query_seq = protein.get('sequence', "")
+        unpaired_msa = protein.get('unpairedMsa', "")
+        
+        input_content = unpaired_msa if unpaired_msa else f">query\n{query_seq}\n"
+        input_file = dir_path / "query.a3m"
+        input_file.write_text(input_content)
+        
+        for a3m_path in a3m_paths:
+            profile = a3m_path.stem
+            out_file = dir_path / f"{profile}.hhr"
+            cmd = [
+                "hhalign",
+                "-i", str(input_file),
+                "-t", str(a3m_path),
+                "-o", str(out_file),
+                "-alt", str(ALT_ALNS)
+            ]
+            
+            result = subprocess.run(cmd, capture_output = True, text = True)
+            if result.returncode != 0:
+                raise RuntimeError(f"hhalign execution failed. Stderr:\n{result.stderr}")
+            if not out_file.is_file():
+                raise RuntimeError(f"hhalign did not generate the output")
+
+            with open(out_file) as file:
+                rules = [ rule for rule in metadata if rule['profile'] == profile ]
+                for hit in read_hhr(file):
+                    if hit['Probab'] >= min_prob:
+                        mapping = hh_mapping(hit, min_conf = min_conf)
+                        for rule in rules:
+                            t_target_pos, expected_res, mod = rule['pos'], rule['res'], rule['mod']
+                            if t_target_pos in mapping:
+                                mapped_q_pos = mapping[t_target_pos]
+                                seq_index = mapped_q_pos - 1 
+                                assert -1 < seq_index < len(query_seq):
+                                if query_seq[seq_index] == expected_res and mapped_q_pos not in output:
+                                    output[mapped_q_pos] = { "ptmType": mod, "ptmPosition": mapped_q_pos }
+    return list(output.values())
+
+def launch_search_mod(input, output_dir, log_file, min_prob, min_conf, selected_mods):
+    json_paths = get_input_jsons(input)
+    if not json_paths:
+        error("No input files supplied", fatal = True)
+
+    metadata, a3m_paths, cif_paths = parse_mod_resources(selected_mods)
+
+    output_path = Path(output_dir).resolve()
+    output_path.mkdir(parents = True, exist_ok = True)
+
+    def process_files(conn):
+        for json_stem, json_path in json_paths.items():
+            try:
+                af3 = AF3json(json_path)
+            except Exception as e:
+                error(f"Could not parse {json_path}: {e}", fatal = True)
+            seqs = list(af3.iter_seq())
+            if not seqs:
+                error(f"{json_path} contains no proteins", fatal = True)
+            yield json_path, seqs
+
+    def wrapper(json_path, seqs, log):
+        try:
+            mods = {}
+            for protein in seqs:
+                sequence = protein['sequence']
+                seq_hash = get_seq_hash(sequence)
+                mods[seq_hash] = search_mod_worker(protein, metadata, a3m_paths, log, min_prob = min_prob, min_conf = min_conf)
+            return json_path, mods
+        except Exception as e:
+            error(f"Got exception: {e}")
+
+    def check_futures(futures, max_num = 1):
+        successes = set()
+        assert max_num > 0
+        while len(futures) >= max_num:
+            futures_done, futures = concurrent.futures.wait(futures, return_when = concurrent.futures.FIRST_COMPLETED)
+            for future in futures_done:
+                json_path, mods = future.result()
+                af3 = AF3json(json_path)
+                ptms = set()
+                for seq in af3.iter_seq():
+                    sequence = seq['sequence']
+                    seq_hash = get_seq_hash(sequence)
+                    if seq_hash in mods and mods[seq_hash]:
+                        seq['modifications'] = mods[seq_hash]
+                        ptms.add(mods[seq_hash]['ptmType'])
+                for ptm in ptms:
+                    cif = cif_files[ptm].read_text()
+                    af3.add_cdd(cif)
+
+                output_json_file = JSONpath(output_path / json_path.name)
+                af3.write(output_json_file)
+                successes.add(str(json_path))
+        return futures, successes
+
+    with get_log(log_file) as log, TPE(max_workers = workers) as executor, tqdm(total = len(json_paths)) as progress_bar:
+        futures = set()
+        success_paths = set()
+        for json_path, seqs in process_files():
+            futures, successes = check_futures(futures, max_num = workers)
+            success_paths |= successes
+            progress_bar.update(len(successes))
+            futures.add(executor.submit(wrapper, json_path, seqs, log))
+        futures, successes = check_futures(futures, conn)
+        success_paths |= successes
+        progress_bar.update(len(successes))
+
+    ok = True
+    for json_stem, json_path in json_paths.items():
+        if str(json_path) not in success_paths:
+            error(f"No results were obtained for {json_path}")
+            ok = False
+    if not ok:
+        error("Something went wrong", fatal = True)
+    all_done()
+
+def all_done():
+    print(f"[✔] All done")
 
 def predict_cli():
     def set_of_int_arg(arg):
@@ -620,3 +824,18 @@ def complex_cli():
     parser.add_argument("-O", "--output", required = True, help = "Output json file")
     args = parser.parse_args()
     launch_complex(args.input, args.output)
+
+def search_mod_cli():
+    parser = argparse.ArgumentParser(description = "AlphaFold3 wrapper: Modification search using homology")
+    parser.add_argument("-i", "--input", required = True, nargs = '+', help = "Path to input json file(s) containing alignments or a directory containing them")
+    parser.add_argument("-O", "--output", required = True, help = "Output directory")
+    parser.add_argument("-D", "--data-dir", required = True, help = "Data directory")
+    parser.add_argument("-p", "--prob", type = int, default = 90, help = "Minimum match probability (default: 90)")
+    parser.add_argument("-c", "--conf", type = int, default = 7, help = "Minimum alignment position confidence (default: 7)")
+    parser.add_argument("-m", "--mods", help = "Only check for these modifications (default: all)")
+    parser.add_argument("-w", "--workers", type = int, default = 1, help = "Number of workers")
+    parser.add_argument("-l", "--log", type = str, help = "Raw log file")
+    args = parser.parse_args()
+    if args.mods:
+        args.mods = set(mod.strip() for mod in args.mods.split(','))
+    launch_search_mod(args.input, args.output, args.log, min_prob = args.prob, min_conf = args.conf, workers = args.workers, selected_mods = args.mods)

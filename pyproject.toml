@@ -31,3 +31,6 @@ alphafold3_predict = "run_alphafold3:predict_cli"
 alphafold3_complex = "run_alphafold3:complex_cli"
 alphafold3_search = "run_alphafold3:search_cli"
 alphafold3_json = "run_alphafold3:json_cli"
+
+[tool.setuptools.package-data]
+"run_alphafold3.src.mods" = ["a3m/*.a3m", "cif/*.cif", "*.csv"]
