@@ -1,2 +1,23 @@
-*.egg-info/
+# Python cache and bytecode
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Python packaging and distribution
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+
+# Vim temporary and swap files
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-z]
+*.un~
+Session.vim
+Sessionx.vim
+tags
+.netrwhist
+*~
