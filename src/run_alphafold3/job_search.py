@@ -32,7 +32,6 @@ def run_worker(seq_hash, sequence, public_path, threads, log):
             "alphafold3", "sh", "-c",
             f"python run_alphafold.py --json_path=/input.json --output_dir=/output --run_inference=false --jackhmmer_n_cpu {threads}"
         ]
-        print(docker_cmd)
         try:
             subprocess.run(docker_cmd, stdout=log, stderr=log, check=True)
             output_json = JSONpath(tmp_path / "query" / "query_data.json")

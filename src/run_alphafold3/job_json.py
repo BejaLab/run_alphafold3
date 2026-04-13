@@ -23,7 +23,7 @@ def cli():
     parser.add_argument("-i", "--input", required=True, nargs='+', help="Path to input fasta file(s) or a directory containing them")
     parser.add_argument("-O", "--output", required=True, help="Output directory")
     args = parser.parse_args()
-    launch_json(args.input, args.output)
+    launch(args.input, args.output)
 
 if __name__ == "__main__":
     cli()
