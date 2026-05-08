@@ -10,9 +10,14 @@ from concurrent.futures import ThreadPoolExecutor as TPE
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import NUM_SAMPLES, get_input_jsons, get_data_paths, fetch_pred, get_results_dir_path, get_results_files_paths, create_dummy_databases
+from run_alphafold3.utils import NUM_SAMPLES, get_input_jsons, get_data_paths, fetch_pred, get_results_dir_path, get_results_files_paths, create_dummy_databases, detect_compute_gpus
 from run_alphafold3.classes import JSONpath, AF3json
 from run_alphafold3.logger import error, get_log, all_done
+
+# --- Constants
+
+DEF_GPUS = detect_compute_gpus()
+MAX_LEN = 5200
 
 def run_worker(data, output_path, model_path, gpu, seeds, log):
     long_query = len(data) >= 3500
@@ -154,13 +159,15 @@ def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, max_len):
 def cli():
     def set_of_int_arg(arg):
         return set(int(x) for x in arg.split(','))
+    def set_of_str_arg(arg):
+        return set(x.strip() for x in arg.split(','))
 
     parser = argparse.ArgumentParser(description="AlphaFold3 wrapper: Predict")
     parser.add_argument("-i", "--input", required=True, nargs='+', help="Path to input json file(s) or a directory containing them")
     parser.add_argument("-O", "--output", required=True, help="Output directory")
     parser.add_argument("-D", "--data-dir", required=True, help="Directory for database")
-    parser.add_argument("-g", "--gpus", type=set_of_int_arg, default=[0], help="GPU indices to use")
-    parser.add_argument("--max-len", type=int, default=5200, help="Maximum total number of amino acid residues (default: no)")
+    parser.add_argument("-g", "--gpus", type=set_of_str_arg, default=DEF_GPUS, help=f"GPUs to use [{','.join(DEF_GPUS)}]")
+    parser.add_argument("--max-len", type=int, default=MAX_LEN, help="Maximum total number of amino acid residues (default: no)")
     parser.add_argument("-s", "--seeds", type=set_of_int_arg, help="Seeds (overrides modelSeeds in json)")
     parser.add_argument("-l", "--log", type=str, help="Raw log file")
     args = parser.parse_args()

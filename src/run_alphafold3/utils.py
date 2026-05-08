@@ -5,6 +5,11 @@ import csv
 import json
 import importlib.resources as pkg_resources
 from pathlib import Path
+import subprocess
+import os
+import sys
+import glob
+import shutil
 
 from run_alphafold3.classes import JSONpath
 from run_alphafold3.logger import error
@@ -14,6 +19,60 @@ NUM_SAMPLES = 5
 ALT_ALNS = 10
 
 # --- Helper Functions ---
+
+def detect_compute_gpus():
+    """
+    Returns a list of logical GPU indices (as strings) by probing compute interfaces.
+    """
+    # 1. Respect the environment variable first
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None:
+        if cvd.strip() in ("", "-1"):
+            return []
+        return [x.strip() for x in cvd.split(",")]
+
+    # 2. NVIDIA Detection (Standard for Windows & Linux ML)
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                text=True,
+                stderr=subprocess.PIPE
+            )
+            indices = [line.strip() for line in out.strip().split('\n') if line.strip()]
+            if indices:
+                return indices
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"nvidia-smi failed to execute. Stderr: {e.stderr}")
+
+    # 3. Linux Native AMD/Intel Detection
+    if sys.platform.startswith('linux'):
+        # /dev/dri/renderD* are Direct Rendering Infrastructure (DRI) nodes.
+        # These strictly map to compute interfaces (Vulkan/ROCm), ignoring basic VGA.
+        render_nodes = glob.glob('/dev/dri/renderD*')
+        if render_nodes:
+            return [str(i) for i in range(len(render_nodes))]
+
+    # 4. macOS Native Detection (Apple Silicon / Metal)
+    if sys.platform == 'darwin':
+        try:
+            out = subprocess.check_output(
+                ['system_profiler', 'SPDisplaysDataType'],
+                text=True,
+                stderr=subprocess.PIPE
+            )
+            count = out.count('Chipset Model')
+            if count > 0:
+                return [str(i) for i in range(count)]
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"macOS system_profiler failed: {e.stderr}")
+
+    # Explicit failure if no compute hardware is identifiable
+    raise RuntimeError(
+        "Failed to detect any compute-capable GPUs. Ensure drivers (NVIDIA/AMD) "
+        "are installed, or set CUDA_VISIBLE_DEVICES manually."
+    )
+
 def parse_mod_resources(selected_mods):
     mods_dir = Path(pkg_resources.files('run_alphafold3.mods'))
     metadata_path = mods_dir.joinpath('mods.csv')
