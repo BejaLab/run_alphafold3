@@ -95,10 +95,12 @@ def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, max_len):
             missing = set()
             for seed in af3.seeds:
                 for sample in range(NUM_SAMPLES):
-                    cif, conf, summ = fetch_pred(conn, json_hash, seed, sample)
+                    cif, summ, conf = fetch_pred(conn, json_hash, seed, sample)
                     if cif:
                         to_path = get_results_dir_path(output_path, af3.name, seed, sample, create=True)
-                        cif_path, summ_path, conf_path = get_results_files_paths(to_path)
+                        cif_path = to_path / "query_model.cif"
+                        summ_path = to_path / "query_summary_confidences.json"
+                        conf_path = to_path / "query_confidences.json"
                         cif_path.write_text(cif)
                         summ_path.write_text(summ)
                         conf_path.write_text(conf)
