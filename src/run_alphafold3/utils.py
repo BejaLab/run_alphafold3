@@ -114,11 +114,11 @@ def get_data_paths(data_dir, create=False):
     data_path = Path(data_dir).resolve()
     if create and not data_path.exists():
         data_path.mkdir(parents=True, exist_ok=True)
-    pred_db_path = data_path / "predictions.sq3"
     search_db_path = data_path / "searches.sq3"
+    pred_db_path = data_path / "predictions.sq3"
     model_path = data_path / "models"
     public_path = data_path / "public_databases"
-    return pred_db_path, search_db_path, model_path, public_path
+    return search_db_path, pred_db_path, model_path, public_path
 
 def clean_record_seq(record_seq):
     return record_seq.upper().strip().replace("*", "").replace("-", "")

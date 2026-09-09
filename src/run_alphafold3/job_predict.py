@@ -169,7 +169,7 @@ def cli():
     parser.add_argument("-O", "--output", required=True, help="Output directory")
     parser.add_argument("-D", "--data-dir", required=True, help="Directory for database")
     parser.add_argument("-g", "--gpus", type=set_of_str_arg, default=DEF_GPUS, help=f"GPUs to use [{','.join(DEF_GPUS)}]")
-    parser.add_argument("--max-len", type=int, default=MAX_LEN, help="Maximum total number of amino acid residues (default: no)")
+    parser.add_argument("--max-len", type=int, default=MAX_LEN, help=f"Maximum total number of amino acid residues (default: {MAX_LEN})")
     parser.add_argument("-s", "--seeds", type=set_of_int_arg, help="Seeds (overrides modelSeeds in json)")
     parser.add_argument("-l", "--log", type=str, help="Raw log file")
     args = parser.parse_args()
