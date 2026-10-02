@@ -87,10 +87,10 @@ class AF3json:
             self.hash = base64.urlsafe_b64encode(raw_hash).decode().rstrip("=")
         return self.hash
 
-    def write(self, path: JSONpath):
+    def write(self, path: JSONpath, name: str = 'query'):
         data = self.data.copy()
         data['modelSeeds'] = self.seeds
-        data['name'] = 'query'
+        data['name'] = name
         if self.ccd:
             data['userCCD'] = ''
             for ccd_name, ccd_lines in self.ccd.items():

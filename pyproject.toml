@@ -29,6 +29,7 @@ dependencies = [
 [project.scripts]
 alphafold3_init = "run_alphafold3.job_init:cli"
 alphafold3_predict = "run_alphafold3.job_predict:cli"
+alphafold3_predict_test = "run_alphafold3.job_predict_test:cli"
 alphafold3_complex = "run_alphafold3.job_complex:cli"
 alphafold3_search = "run_alphafold3.job_search:cli"
 alphafold3_search_mod = "run_alphafold3.job_search_mod:cli"

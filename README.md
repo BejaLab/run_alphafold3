@@ -17,7 +17,7 @@ everything around it:
   the corresponding `modifications` entries and CCD blocks into the job JSON.
 * **Result selection** — pick the best seed/sample per query by `ranking_score`.
 
-The package installs seven command-line tools, all named `alphafold3_*`.
+The package installs eight command-line tools, all named `alphafold3_*`.
 
 ## Requirements
 
@@ -26,7 +26,7 @@ The package installs seven command-line tools, all named `alphafold3_*`.
   (built as described in the AlphaFold3 repository)
 * AlphaFold3 model weights and public sequence databases (see *Data directory* below)
 * [`hhalign`](https://github.com/soedinglab/hh-suite) on `$PATH` — only for `alphafold3_search_mod`
-* NVIDIA GPU(s) with drivers and the container toolkit — only for `alphafold3_predict`
+* NVIDIA GPU(s) with drivers and the container toolkit — for `alphafold3_init` and `alphafold3_predict`
 
 ## Installation
 
@@ -44,17 +44,21 @@ Most tools take `-D/--data-dir`, a single directory holding everything persisten
 <data-dir>/
 ├── searches.sq3        # cached MSAs and templates, keyed by sequence hash
 ├── predictions.sq3     # cached structures and confidences, keyed by job hash
+├── jax_cache/          # compiled AlphaFold3 model, one entry per bucket size
+├── environment.txt     # what the compiled model and the predictions depend on
 ├── models/             # AlphaFold3 model weights
 └── public_databases/   # AlphaFold3 sequence databases
 ```
 
-`models/` and `public_databases/` must be provided by the user; the two SQLite files are created by `alphafold3_init`.
+`models/` and `public_databases/` must be provided by the user; everything else is created by `alphafold3_init`.
 
 ## Typical pipeline
 
 ```bash
-# 0. one-off: create the cache databases
-alphafold3_init -D data
+# 0. one-off (and after any change of AlphaFold3, GPU or driver): create the databases
+#    and compile the model
+alphafold3_init -D data -l init.log
+alphafold3_predict_test -D data
 
 # 1. FASTA -> one AlphaFold3 job JSON per record
 alphafold3_json -i sequences.fasta -O queries/json
@@ -70,7 +74,7 @@ alphafold3_complex -i 3 queries/search_mod/protA.json -i queries/search_mod/prot
                    -O queries/complex/AAAB.json
 
 # 5. structure prediction (GPU, cached)
-alphafold3_predict -i queries/search_mod -O queries/predict -D data -s 1,123,124 -l predict.log
+alphafold3_predict -i queries/search_mod -O queries/predict -D data -s 1,123,124 -b 10 -l predict.log
 
 # 6. keep the best-ranked sample per query
 alphafold3_select -i queries/predict -O queries/select -l
@@ -83,14 +87,35 @@ Predictions land in `<output>/<query>/seed-<seed>_sample-<sample>/`, five sample
 
 ## Tools
 
-### `alphafold3_init` — initialize the database
+### `alphafold3_init` — initialize the database and compile the model
 
-Creates the data directory and the two SQLite caches. Run once before anything else.
+Creates the data directory and the two SQLite caches, then compiles the AlphaFold3 model for each
+of AlphaFold3's bucket sizes (inputs are padded to the smallest bucket that fits them) and stores
+the result in `jax_cache/`. Compilation dominates the run time of a small prediction and is done
+here once, so that `alphafold3_predict` only loads the compiled model. Using the same compiled model
+also makes predictions bit-for-bit reproducible.
+
+Buckets are compiled on the first given GPU (any other given GPUs are only checked to be of the
+same model), smallest first, with normal GPU memory
+settings until a bucket does not fit and with unified memory (spilling into host RAM) from then on;
+compilation stops at the first bucket that does not fit either. The largest bucket thus depends on
+the available GPU and host memory. The outcome and timing of each attempt are printed, separating
+the compilation itself from the overhead of the container run.
+
+`environment.txt` records what the compiled model and the predictions depend on: the AlphaFold3
+version and Docker image, JAX, XLA flags, the GPU model and driver, the model weights and
+settings and the bucket sizes, as well as the memory mode and the cache entry of each compiled
+bucket and the GPU it was compiled on. Run `alphafold3_init` again whenever any of this changes;
+`alphafold3_predict` refuses to run otherwise. The compiled model can be used on any GPU of the
+same model (see `alphafold3_predict`).
 
 ```
-usage: alphafold3_init [-h] -D DATA_DIR [--overwrite]
+usage: alphafold3_init [-h] -D DATA_DIR [-g GPUS] [-l LOG] [--overwrite]
 
   -D, --data-dir DATA_DIR   Base directory for data
+  -g, --gpus GPUS           GPUs, all of the same model; the first one is used for compilation
+                            (default: all detected, comma-separated)
+  -l, --log LOG             Raw log file
       --overwrite           Over-write the database files if exist
 ```
 
@@ -164,21 +189,54 @@ usage: alphafold3_search_mod [-h] -i INPUT [INPUT ...] -O OUTPUT [-p PROB]
 
 ### `alphafold3_predict` — predict structures
 
-Runs AlphaFold3 inference, one job per GPU at a time, and caches every seed/sample result
-in `predictions.sq3`; cached results are written out without touching the GPU.
-Memory settings are relaxed automatically for queries of ≥ 3500 residues.
+Runs AlphaFold3 inference and caches every seed/sample result in `predictions.sq3`; cached
+results are written out without touching the GPU. Before anything else, the environment is checked
+against `environment.txt` written by `alphafold3_init`.
+
+Jobs are run in batches of `--batch-size` per AlphaFold3 run, so that the model is loaded once per
+batch. Each job is assigned to a bucket by its number of tokens, counted by AlphaFold3 itself
+(modified residues and ligands take one token per atom), and runs under the memory mode its bucket
+was compiled with. Jobs larger than the largest compiled bucket are rejected. Batches in normal
+memory mode run in parallel on all GPUs; batches in unified memory mode come after them and run one
+at a time, since they share host RAM. If a batch fails, its unfinished jobs are retried one by one.
+
+JAX keys compiled models by the physical GPU, but GPUs of the same model run the same compiled
+model. For each GPU, the compiled model of the buckets needed is linked under that GPU's cache keys
+in a temporary directory, which is used as the compilation cache; computing the keys takes a short
+container run per GPU, except for the GPU `alphafold3_init` compiled on. All GPUs thus run the
+same compiled model and give identical results.
+
+The compilation cache is mounted read-only, so a job never compiles the model. Every protein
+chain needs `unpairedMsa`, `pairedMsa` and `templates` and every RNA chain `unpairedMsa`
+(as written by `alphafold3_search`); set them to `""` and `[]` for single-sequence predictions.
 
 ```
 usage: alphafold3_predict [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
-                          [-g GPUS] [--max-len MAX_LEN] [-s SEEDS] [-l LOG]
+                          [-g GPUS] [-b BATCH_SIZE] [-s SEEDS] [-l LOG]
 
   -i, --input INPUT [INPUT ...]   Path to input json file(s) or a directory containing them
   -O, --output OUTPUT             Output directory
   -D, --data-dir DATA_DIR         Directory for database
   -g, --gpus GPUS                 GPUs to use (default: all detected, comma-separated)
-      --max-len MAX_LEN           Maximum total number of amino acid residues (default: 5200)
+  -b, --batch-size BATCH_SIZE     Number of jobs per AlphaFold3 run (default: 10)
   -s, --seeds SEEDS               Seeds (overrides modelSeeds in json)
   -l, --log LOG                   Raw log file
+```
+
+### `alphafold3_predict_test` — test prediction
+
+Predicts a small protein (single-sequence ubiquitin) on each of the given GPUs in turn, through the
+same code path as `alphafold3_predict` but with a temporary prediction database, and checks the
+output: five samples with all residues, the confidences files and the database rows. Since the
+compilation cache is read-only, this also checks that each GPU finds the compiled model, and the
+results must be identical on all GPUs. Run it after `alphafold3_init`.
+
+```
+usage: alphafold3_predict_test [-h] -D DATA_DIR [-g GPUS] [-l LOG]
+
+  -D, --data-dir DATA_DIR   Directory for database
+  -g, --gpus GPUS           GPUs to test (default: all detected, comma-separated)
+  -l, --log LOG             Raw log file
 ```
 
 ### `alphafold3_select` — extract the best structures

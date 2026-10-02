@@ -17,8 +17,59 @@ from run_alphafold3.logger import error
 # --- Constants ---
 NUM_SAMPLES = 5
 ALT_ALNS = 10
+AF3_IMAGE = "alphafold3"
+
+SEARCHES_SCHEMA = [
+    "CREATE TABLE IF NOT EXISTS proteins (seq_hash TEXT PRIMARY KEY, seq TEXT UNIQUE NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS searches (seq_hash TEXT, unpaired_msa TEXT, templates TEXT, PRIMARY KEY (seq_hash))",
+]
+PREDICTIONS_SCHEMA = [
+    "CREATE TABLE IF NOT EXISTS predictions (json_hash TEXT, seed INT, sample INT, cif TEXT, summary TEXT, confidences TEXT, PRIMARY KEY (json_hash, seed, sample))",
+]
+
+# Settings that change the compiled model: alphafold3_init warms the JAX compilation cache
+# with exactly these, and alphafold3_predict must run with them to hit the cache.
+# Bucket sizes are AlphaFold3's defaults, recorded by alphafold3_init in environment.txt.
+NUM_RECYCLES = 10
+FLASH_ATTENTION = "triton"
+
+# XLA tunes the compiled model to the memory it can use, so each bucket is compiled by
+# alphafold3_init and run by alphafold3_predict under the same one of these
+MEMORY_ENV = {
+    "normal": {
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
+        "XLA_CLIENT_MEM_FRACTION": "0.95",
+    },
+    "unified": {
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        "TF_FORCE_UNIFIED_MEMORY": "true",
+        "XLA_CLIENT_MEM_FRACTION": "3.2",
+    },
+}
 
 # --- Helper Functions ---
+
+def model_flags():
+    """Flags shared by run_alphafold.py and the cache warm-up script."""
+    return [
+        f"--num_diffusion_samples={NUM_SAMPLES}",
+        f"--num_recycles={NUM_RECYCLES}",
+        f"--flash_attention_implementation={FLASH_ATTENTION}",
+    ]
+
+def docker_cmd(args, gpus=None, volumes={}, env={}):
+    """
+    Builds a `docker run` command line for the AlphaFold3 image.
+    volumes maps host paths to container paths (append ":ro" to mount read-only).
+    """
+    cmd = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}"]
+    for host_path, container_path in volumes.items():
+        cmd += ["--volume", f"{host_path}:{container_path}"]
+    if gpus is not None:
+        cmd += ["--gpus", "all", "--env", f"CUDA_VISIBLE_DEVICES={','.join(gpus)}"]
+    for key, val in env.items():
+        cmd += ["--env", f"{key}={val}"]
+    return cmd + [AF3_IMAGE] + list(args)
 
 def detect_compute_gpus():
     """
@@ -120,6 +171,12 @@ def get_data_paths(data_dir, create=False):
     public_path = data_path / "public_databases"
     return search_db_path, pred_db_path, model_path, public_path
 
+def get_cache_paths(data_dir):
+    data_path = Path(data_dir).resolve()
+    cache_path = data_path / "jax_cache"
+    env_path = data_path / "environment.txt"
+    return cache_path, env_path
+
 def clean_record_seq(record_seq):
     return record_seq.upper().strip().replace("*", "").replace("-", "")
 
@@ -144,8 +201,15 @@ def get_results_dir_path(prefix_path, stem, seed, sample, create=False):
 def get_results_files_paths(path):
     cif_path = next(path.glob("*model.cif"))
     sum_conf_path = next(path.glob("*summary_confidences.json"))
-    conf_path = next(path.glob("*confidences.json"))
+    # "*confidences.json" alone would also match the summary file
+    conf_path = next(p for p in path.glob("*confidences.json") if not p.name.endswith("summary_confidences.json"))
     return cif_path, sum_conf_path, conf_path
+
+def write_results(path, cif, summ, conf):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "query_model.cif").write_text(cif)
+    (path / "query_summary_confidences.json").write_text(summ)
+    (path / "query_confidences.json").write_text(conf)
 
 def get_input_files(input_val, exts):
     files = input_val if isinstance(input_val, list) else [input_val]
@@ -168,24 +232,6 @@ def get_input_jsons(input_val):
             error(f"Stem {json_path.stem} in {json_path} is found in a different input json file", fatal=True)
         json_paths[json_path.stem] = json_path
     return json_paths
-
-def create_dummy_databases(path):
-    public_path = path / "public_databases"
-    public_path.mkdir(exist_ok=True)
-    dbs = [
-        "bfd-first_non_consensus_sequences.fasta",
-        "mgy_clusters_2022_05.fa",
-        "uniprot_all_2021_04.fa", 
-        "uniref90_2022_05.fa",
-        "nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",
-        "rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",
-        "rnacentral_active_seq_id_90_cov_80_linclust.fasta",
-        "mmcif_files",
-        "pdb_seqres_2022_09_28.fasta"
-    ]
-    for db in dbs:
-        (public_path / db).touch()
-    return public_path
 
 def hh_mapping(hit, min_conf):
     mapping = {}

@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor as TPE
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import get_input_jsons, get_data_paths, get_seq_hash, fetch_search
+from run_alphafold3.utils import AF3_IMAGE, get_input_jsons, get_data_paths, get_seq_hash, fetch_search
 from run_alphafold3.classes import JSONpath, AF3json
 from run_alphafold3.logger import error, get_log, all_done
 
@@ -29,7 +29,7 @@ def run_worker(seq_hash, sequence, public_path, threads, log):
             "--volume", f"{tmp_path}:/output",
             "--volume", f"{public_path}:/public_databases",
             "--volume", f"{top_dir}:{top_dir}",
-            "alphafold3", "sh", "-c",
+            AF3_IMAGE, "sh", "-c",
             f"python run_alphafold.py --json_path=/input.json --output_dir=/output --run_inference=false --jackhmmer_n_cpu {threads}"
         ]
         try:
