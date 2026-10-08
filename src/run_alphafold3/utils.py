@@ -63,7 +63,9 @@ def container_cmd(image_path, args, gpus=None, volumes={}, env={}):
     The host environment and home directory are kept out of the container, so that it only
     sees the image's own environment and Python packages.
     """
-    cmd = ["apptainer", "exec", "--cleanenv", "--no-home", "--pwd", "/app/alphafold"]
+    # AlphaFold3 needs no network: not binding the host's resolv.conf lets the container start
+    # where its target is hidden, e.g. under a private /run in a sandbox
+    cmd = ["apptainer", "exec", "--cleanenv", "--no-home", "--no-mount", "/etc/resolv.conf", "--pwd", "/app/alphafold"]
     for host_path, container_path in volumes.items():
         cmd += ["--bind", f"{host_path}:{container_path}"]
     if gpus is not None:
@@ -172,6 +174,20 @@ def get_data_paths(data_dir, create=False):
     model_path = data_path / "models"
     public_path = data_path / "public_databases"
     return search_db_path, pred_db_path, model_path, public_path
+
+def open_cache(db_path, read_only=False):
+    """
+    Connects to a cache database. A read-only connection never writes to it, but waits for the
+    commits of others writing to it at the same time.
+    """
+    if not read_only:
+        return sqlite3.connect(db_path)
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.OperationalError as e:
+        error(f"Cannot read {db_path} read-only ({e}). A writer that crashed may have left a journal, which only a writer can roll back: run once without --read-only-cache", fatal=True)
+    return conn
 
 def get_cache_paths(data_dir):
     data_path = Path(data_dir).resolve()

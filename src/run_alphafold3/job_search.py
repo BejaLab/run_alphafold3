@@ -2,13 +2,12 @@ import argparse
 import subprocess
 import tempfile
 import json
-import sqlite3
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor as TPE
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import get_input_jsons, get_data_paths, get_image_path, get_seq_hash, fetch_search, container_cmd
+from run_alphafold3.utils import get_input_jsons, get_data_paths, get_image_path, get_seq_hash, fetch_search, container_cmd, open_cache
 from run_alphafold3.classes import JSONpath, AF3json
 from run_alphafold3.logger import error, get_log, all_done
 
@@ -39,7 +38,7 @@ def run_worker(image_path, seq_hash, sequence, public_path, threads, log):
             
     return output
 
-def launch(input_val, output_dir, data_dir, log_file, workers, threads):
+def launch(input_val, output_dir, data_dir, log_file, workers, threads, read_only_cache=False):
     json_paths = get_input_jsons(input_val)
     if not json_paths:
         error("No input files supplied", fatal=True)
@@ -89,9 +88,10 @@ def launch(input_val, output_dir, data_dir, log_file, workers, threads):
             futures_done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in futures_done:
                 json_path, present, added = future.result()
-                for seq_hash, (unpaired_msa, templates) in added.items():
-                    conn.execute("INSERT OR IGNORE INTO searches VALUES (?, ?, ?)", (seq_hash, unpaired_msa, json.dumps(templates)))
-                conn.commit()
+                if not read_only_cache:
+                    for seq_hash, (unpaired_msa, templates) in added.items():
+                        conn.execute("INSERT OR IGNORE INTO searches VALUES (?, ?, ?)", (seq_hash, unpaired_msa, json.dumps(templates)))
+                    conn.commit()
                 af3 = AF3json(json_path)
                 for seq in af3.iter_seq():
                     sequence = seq['sequence']
@@ -109,7 +109,7 @@ def launch(input_val, output_dir, data_dir, log_file, workers, threads):
                 successes.add(str(json_path))
         return futures, successes
 
-    with get_log(log_file) as log, TPE(max_workers=workers) as executor, sqlite3.connect(search_db_path) as conn, tqdm(total=len(json_paths)) as progress_bar:
+    with get_log(log_file) as log, TPE(max_workers=workers) as executor, open_cache(search_db_path, read_only_cache) as conn, tqdm(total=len(json_paths)) as progress_bar:
         futures = set()
         success_paths = set()
         for json_path, present, missing in process_files(conn):
@@ -138,10 +138,11 @@ def cli():
     parser.add_argument("-w", "--workers", type=int, default=1, help="Number of workers")
     parser.add_argument("-t", "--threads", type=int, default=1, help="Number of threads per worker")
     parser.add_argument("-l", "--log", type=str, help="Raw log file")
+    parser.add_argument("--read-only-cache", action="store_true", help="Use cached searches, but do not add new ones to the cache")
     args = parser.parse_args()
     launch(
         args.input, args.output, args.data_dir, args.log,
-        workers=args.workers, threads=args.threads
+        workers=args.workers, threads=args.threads, read_only_cache=args.read_only_cache
     )
 
 if __name__ == "__main__":

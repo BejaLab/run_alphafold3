@@ -217,11 +217,11 @@ usage: alphafold3_complex [-h] -i N [FILE ...] -O OUTPUT
 Runs the AlphaFold3 data pipeline for every protein chain not yet in `searches.sq3`,
 then writes copies of the input JSONs with `unpairedMsa` and `templates` filled in.
 `pairedMsa` is blanked. `--workers` jobs run concurrently, each with `--threads` jackhmmer
-CPUs.
+CPUs. With `--read-only-cache`, `searches.sq3` is only read (see *Read-only caches* below).
 
 ```
 usage: alphafold3_search [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
-                         [-w WORKERS] [-t THREADS] [-l LOG]
+                         [-w WORKERS] [-t THREADS] [-l LOG] [--read-only-cache]
 
   -i, --input INPUT [INPUT ...]   Path to input json file(s) or a directory containing them
   -O, --output OUTPUT             Output directory
@@ -229,6 +229,7 @@ usage: alphafold3_search [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
   -w, --workers WORKERS           Number of workers
   -t, --threads THREADS           Number of threads per worker
   -l, --log LOG                   Raw log file
+      --read-only-cache           Use cached searches, but do not add new ones to the cache
 ```
 
 ### `alphafold3_search_mod` — modification search using homology
@@ -280,6 +281,7 @@ chain needs `unpairedMsa`, `pairedMsa` and `templates` and every RNA chain `unpa
 ```
 usage: alphafold3_predict [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
                           [-g GPUS] [-b BATCH_SIZE] [-s SEEDS] [-l LOG]
+                          [--read-only-cache]
 
   -i, --input INPUT [INPUT ...]   Path to input json file(s) or a directory containing them
   -O, --output OUTPUT             Output directory
@@ -288,7 +290,17 @@ usage: alphafold3_predict [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
   -b, --batch-size BATCH_SIZE     Number of jobs per AlphaFold3 run (default: 10)
   -s, --seeds SEEDS               Seeds (overrides modelSeeds in json)
   -l, --log LOG                   Raw log file
+      --read-only-cache           Use cached predictions, but do not add new ones to the cache
 ```
+
+#### Read-only caches
+
+With `--read-only-cache`, `alphafold3_search` and `alphafold3_predict` look results up in
+`searches.sq3` and `predictions.sq3` as usual but never write to them, and open them read-only, so
+that they also work on a data directory the user cannot write, e.g. from a sandbox. Searches and
+predictions that are not cached are run every time. Jobs writing to the caches at the same time
+are waited for. If a writer crashed in the middle of a write, the database cannot be read read-only
+until a run without `--read-only-cache` has rolled it back.
 
 ### `alphafold3_predict_test` — test prediction
 

@@ -3,14 +3,13 @@ import subprocess
 import tempfile
 import threading
 import queue
-import sqlite3
 import json
 from collections import deque, namedtuple
 from concurrent.futures import ThreadPoolExecutor as TPE
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import NUM_SAMPLES, MEMORY_ENV, get_input_jsons, get_data_paths, get_cache_paths, fetch_pred, get_results_dir_path, get_results_files_paths, write_results, get_image_path, container_cmd, model_flags, detect_compute_gpus
+from run_alphafold3.utils import NUM_SAMPLES, MEMORY_ENV, get_input_jsons, get_data_paths, get_cache_paths, fetch_pred, get_results_dir_path, get_results_files_paths, write_results, get_image_path, open_cache, container_cmd, model_flags, detect_compute_gpus
 from run_alphafold3.environment import probe_environment, read_environment, compare_environment, parse_compiled_buckets
 from run_alphafold3.model_cache import cache_keys
 
@@ -147,7 +146,7 @@ def run_batch(image_path, jobs, mode, gpu, output_path, model_path, cache_path, 
                 unfinished.append(Job(job.json_path, missing))
     return results, unfinished
 
-def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, batch_size):
+def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, batch_size, read_only_cache=False):
     json_paths = get_input_jsons(input_val)
     if not json_paths:
         error("No input files supplied", fatal=True)
@@ -166,15 +165,18 @@ def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, batch_size):
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    failed = predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size)
+    failed = predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size, read_only_cache)
     for json_path in failed:
         error(f"No predictions were obtained for {json_path}")
     if failed:
         error("Something went wrong", fatal=True)
     all_done()
 
-def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size):
-    """Predicts structures for json_paths (stem -> path). Returns the paths that failed."""
+def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size, read_only_cache=False):
+    """
+    Predicts structures for json_paths (stem -> path). Returns the paths that failed.
+    With read_only_cache, uses cached predictions, but does not add new ones to the cache.
+    """
     recorded = read_environment(env_path)
     try:
         current = probe_environment(gpus, model_path, image_path)
@@ -191,7 +193,7 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
     # Restore cached predictions, collect the rest
     jobs = []
     success_paths = set()
-    with sqlite3.connect(pred_db_path) as conn:
+    with open_cache(pred_db_path, read_only_cache) as conn:
         for json_stem, json_path in json_paths.items():
             try:
                 af3 = AF3json(json_path, seeds=seeds)
@@ -212,7 +214,7 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
             else:
                 success_paths.add(str(json_path))
 
-    with get_log(log_file) as log, sqlite3.connect(pred_db_path) as conn, tqdm(total=len(json_paths)) as progress_bar, tempfile.TemporaryDirectory() as links_dir:
+    with get_log(log_file) as log, open_cache(pred_db_path, read_only_cache) as conn, tqdm(total=len(json_paths)) as progress_bar, tempfile.TemporaryDirectory() as links_dir:
         progress_bar.update(len(success_paths))
 
         # Each bucket runs under the memory mode it was compiled with
@@ -290,7 +292,8 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
             else:
                 for json_path, json_hash, seed, sample, to_path in event:
                     cif_path, summ_path, conf_path = get_results_files_paths(to_path)
-                    conn.execute("INSERT OR IGNORE INTO predictions VALUES (?, ?, ?, ?, ?, ?)", (json_hash, seed, sample, cif_path.read_text(), summ_path.read_text(), conf_path.read_text()))
+                    if not read_only_cache:
+                        conn.execute("INSERT OR IGNORE INTO predictions VALUES (?, ?, ?, ?, ?, ?)", (json_hash, seed, sample, cif_path.read_text(), summ_path.read_text(), conf_path.read_text()))
                     seeds_left = remaining[str(json_path)]
                     seeds_left.discard(seed)
                     if not seeds_left and str(json_path) not in success_paths:
@@ -314,12 +317,13 @@ def cli():
     parser.add_argument("-b", "--batch-size", type=int, default=DEF_BATCH_SIZE, help=f"Number of jobs per AlphaFold3 run (default: {DEF_BATCH_SIZE})")
     parser.add_argument("-s", "--seeds", type=set_of_int_arg, help="Seeds (overrides modelSeeds in json)")
     parser.add_argument("-l", "--log", type=str, help="Raw log file")
+    parser.add_argument("--read-only-cache", action="store_true", help="Use cached predictions, but do not add new ones to the cache")
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
     launch(
         args.input, args.output, args.data_dir, args.log,
-        seeds=args.seeds, gpus=args.gpus, batch_size=args.batch_size
+        seeds=args.seeds, gpus=args.gpus, batch_size=args.batch_size, read_only_cache=args.read_only_cache
     )
 
 if __name__ == "__main__":
