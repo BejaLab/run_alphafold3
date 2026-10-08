@@ -8,12 +8,14 @@ import time
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import MEMORY_ENV, SEARCHES_SCHEMA, PREDICTIONS_SCHEMA, get_data_paths, get_cache_paths, detect_compute_gpus
+from run_alphafold3.utils import MEMORY_ENV, SEARCHES_SCHEMA, PREDICTIONS_SCHEMA, get_data_paths, get_cache_paths, get_image_path, detect_compute_gpus
 from run_alphafold3.environment import probe_environment, write_environment, gpu_uuids
 from run_alphafold3.model_cache import warm_cmd, cache_keys
 from run_alphafold3.logger import error, get_log, all_done
 
 DEF_GPUS = detect_compute_gpus()
+# The Docker image built as described in the AlphaFold3 repository
+DEF_IMAGE_SOURCE = "docker-daemon://alphafold3:latest"
 
 def gpu_memory(gpu):
     out = subprocess.check_output(["nvidia-smi", "-i", gpu, "--query-gpu=memory.total", "--format=csv,noheader,nounits"], text=True)
@@ -25,7 +27,7 @@ def host_memory_available():
             if line.startswith("MemAvailable:"):
                 return int(line.split()[1]) * 2**10
 
-def compile_buckets(buckets, mode, gpu, model_path, cache_path, log, progress_bar, previous=None):
+def compile_buckets(image_path, buckets, mode, gpu, model_path, cache_path, log, progress_bar, previous=None):
     """
     Compiles the model for the buckets in one container, smallest first, until one does not fit
     into memory. Adds the cache entries of those that fit to cache_path and returns
@@ -43,7 +45,7 @@ def compile_buckets(buckets, mode, gpu, model_path, cache_path, log, progress_ba
     with tempfile.TemporaryDirectory() as tmp_dir:
         start = time.time()
         compile_time = 0
-        cmd = warm_cmd(buckets, MEMORY_ENV[mode], gpu, model_path, tmp_dir, extra)
+        cmd = warm_cmd(image_path, buckets, MEMORY_ENV[mode], gpu, model_path, tmp_dir, extra)
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True) as proc:
             for line in proc.stdout:
                 result = json.loads(line)
@@ -77,7 +79,7 @@ def compile_buckets(buckets, mode, gpu, model_path, cache_path, log, progress_ba
             shutil.copytree(autotune_dir, cache_path / autotune_dir.name, dirs_exist_ok=True)
     return fitted
 
-def launch(data_dir, gpus, log_file, overwrite = False):
+def launch(data_dir, gpus, log_file, image_source, overwrite = False):
     search_db_path, pred_db_path, model_path, public_path = get_data_paths(data_dir, create=True)
     cache_path, env_path = get_cache_paths(data_dir)
     print(f"[*] Initializing the database")
@@ -97,30 +99,44 @@ def launch(data_dir, gpus, log_file, overwrite = False):
     if not gpus:
         error("No GPUs given", fatal=True)
 
-    print(f"[*] Probing the environment on GPU(s) {','.join(gpus)}")
-    try:
-        env = probe_environment(gpus, model_path)
-    except RuntimeError as e:
-        error(str(e), fatal=True)
-
-    # The cache must hold exactly what environment.txt describes
-    env_path.unlink(missing_ok=True)
-    shutil.rmtree(cache_path, ignore_errors=True)
-    cache_path.mkdir()
-
-    # Smallest bucket first: normal memory until a bucket does not fit, then unified memory
-    # from that bucket on, until a bucket does not fit either
-    print(f"[*] Compiling the model on GPU {gpus[0]} ({env['gpu']})")
-    buckets = [int(b) for b in env["buckets"].split(',')]
-    compiled = {}
     with get_log(log_file) as log:
+        image_path = get_image_path(data_dir, must_exist=False)
+        if not image_path.exists():
+            print(f"[*] Building the AlphaFold3 image from {image_source}")
+            start = time.time()
+            # Into a temporary name, so that a failed build does not leave a broken image behind
+            partial_path = image_path.with_name(image_path.name + ".partial")
+            partial_path.unlink(missing_ok=True)
+            proc = subprocess.run(["apptainer", "build", str(partial_path), image_source], stdout=log, stderr=log)
+            if proc.returncode != 0:
+                partial_path.unlink(missing_ok=True)
+                error("Building the image failed. Check log file.", fatal=True)
+            partial_path.rename(image_path)
+            print(f"[*] Image written to {image_path} ({time.time() - start:.0f} s)")
+
+        print(f"[*] Probing the environment on GPU(s) {','.join(gpus)}")
+        try:
+            env = probe_environment(gpus, model_path, image_path)
+        except RuntimeError as e:
+            error(str(e), fatal=True)
+
+        # The cache must hold exactly what environment.txt describes
+        env_path.unlink(missing_ok=True)
+        shutil.rmtree(cache_path, ignore_errors=True)
+        cache_path.mkdir()
+
+        # Smallest bucket first: normal memory until a bucket does not fit, then unified memory
+        # from that bucket on, until a bucket does not fit either
+        print(f"[*] Compiling the model on GPU {gpus[0]} ({env['gpu']})")
+        buckets = [int(b) for b in env["buckets"].split(',')]
+        compiled = {}
         with tqdm(total=len(buckets)) as progress_bar:
             previous = None
             for mode in ["normal", "unified"]:
                 remaining = [b for b in buckets if b not in compiled]
                 if not remaining:
                     break
-                fitted = compile_buckets(remaining, mode, gpus[0], model_path, cache_path, log, progress_bar, previous)
+                fitted = compile_buckets(image_path, remaining, mode, gpus[0], model_path, cache_path, log, progress_bar, previous)
                 for bucket, (entry, peak) in fitted.items():
                     compiled[bucket] = mode, entry
                     previous = bucket, peak
@@ -132,7 +148,7 @@ def launch(data_dir, gpus, log_file, overwrite = False):
         # model under them: the key of this GPU must match the entry just compiled
         start = time.time()
         smallest = min(compiled)
-        if cache_keys([smallest], gpus[0], model_path, log)[smallest] != compiled[smallest][1]:
+        if cache_keys(image_path, [smallest], gpus[0], model_path, log)[smallest] != compiled[smallest][1]:
             error("The computed compilation cache key does not match the compiled model", fatal=True)
         print(f"[*] Cache key computation checked on GPU {gpus[0]} ({time.time() - start:.0f} s)")
 
@@ -154,9 +170,10 @@ def cli():
     parser.add_argument("-D", "--data-dir", required=True, help="Base directory for data")
     parser.add_argument("-g", "--gpus", type=list_of_str_arg, default=DEF_GPUS, help=f"GPUs, all of the same model; the first one is used for compilation [{','.join(DEF_GPUS)}]")
     parser.add_argument("-l", "--log", type=str, help="Raw log file")
+    parser.add_argument("--image-source", default=DEF_IMAGE_SOURCE, help=f"Source to build the AlphaFold3 image from, if there is none in the data directory, in any form accepted by `apptainer build` [{DEF_IMAGE_SOURCE}]")
     parser.add_argument("--overwrite", action = 'store_true', help="Over-write the database files if exist")
     args = parser.parse_args()
-    launch(args.data_dir, args.gpus, args.log, overwrite = args.overwrite)
+    launch(args.data_dir, args.gpus, args.log, args.image_source, overwrite = args.overwrite)
 
 if __name__ == "__main__":
     cli()

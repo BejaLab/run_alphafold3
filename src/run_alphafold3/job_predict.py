@@ -10,8 +10,8 @@ from concurrent.futures import ThreadPoolExecutor as TPE
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import NUM_SAMPLES, MEMORY_ENV, get_input_jsons, get_data_paths, get_cache_paths, fetch_pred, get_results_dir_path, get_results_files_paths, write_results, docker_cmd, model_flags, detect_compute_gpus
-from run_alphafold3.environment import probe_environment, read_environment, compare_environment, parse_compiled_buckets, gpu_uuids
+from run_alphafold3.utils import NUM_SAMPLES, MEMORY_ENV, get_input_jsons, get_data_paths, get_cache_paths, fetch_pred, get_results_dir_path, get_results_files_paths, write_results, get_image_path, container_cmd, model_flags, detect_compute_gpus
+from run_alphafold3.environment import probe_environment, read_environment, compare_environment, parse_compiled_buckets
 from run_alphafold3.model_cache import cache_keys
 
 # XLA's autotuning results, kept in the compilation cache
@@ -67,11 +67,11 @@ def read_results(path):
     except StopIteration:
         return None
 
-def count_tokens(jobs, log):
+def count_tokens(image_path, jobs, log):
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, job in enumerate(jobs):
             AF3json(job.json_path, seeds=job.seeds).write(JSONpath(Path(tmp_dir) / f"{i}.json"), name=str(i))
-        cmd = docker_cmd(["python", "-c", TOKEN_SCRIPT, "/input"], volumes={tmp_dir: "/input:ro"})
+        cmd = container_cmd(image_path, ["python", "-c", TOKEN_SCRIPT, "/input"], volumes={tmp_dir: "/input:ro"})
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=log, text=True)
     records = {}
     for line in proc.stdout.splitlines():
@@ -79,20 +79,19 @@ def count_tokens(jobs, log):
         records[int(record["name"])] = record
     return [records.get(i, {"error": "Could not count tokens. Check log file."}) for i in range(len(jobs))]
 
-def link_compiled(buckets, compiled, compiled_on, gpus, links_path, model_path, log):
+def link_compiled(image_path, buckets, compiled, gpus, links_path, model_path, log):
     """
-    The cache key of the compiled model depends on the physical GPU, but GPUs of the same model
-    run the same compiled model. For each GPU, makes a directory with links to the compiled model
-    of the buckets under the GPU's cache keys, to be mounted as the compilation cache, with the
-    compilation cache itself mounted at /compiled. Returns {gpu: links directory}.
+    The cache key of the compiled model depends on the physical GPU and on the container runtime,
+    but GPUs of the same model run the same compiled model. For each GPU, makes a directory with
+    links to the compiled model of the buckets under the GPU's cache keys, to be mounted as the
+    compilation cache, with the compilation cache itself mounted at /compiled.
+    Returns {gpu: links directory}.
     """
-    uuids = dict(zip(gpus, gpu_uuids(gpus)))
     with TPE(max_workers=len(gpus)) as executor:
-        # No need to compute the keys of the GPU the model was compiled on
-        futures = {gpu: executor.submit(cache_keys, buckets, gpu, model_path, log) for gpu in gpus if uuids[gpu] != compiled_on}
+        futures = {gpu: executor.submit(cache_keys, image_path, buckets, gpu, model_path, log) for gpu in gpus}
         link_paths = {}
         for gpu in gpus:
-            keys = futures[gpu].result() if gpu in futures else {bucket: compiled[bucket][1] for bucket in buckets}
+            keys = futures[gpu].result()
             link_path = links_path / gpu
             link_path.mkdir()
             (link_path / AUTOTUNE_DIR).symlink_to(f"/compiled/{AUTOTUNE_DIR}")
@@ -101,7 +100,7 @@ def link_compiled(buckets, compiled, compiled_on, gpus, links_path, model_path, 
             link_paths[gpu] = link_path
     return link_paths
 
-def run_batch(jobs, mode, gpu, output_path, model_path, cache_path, link_path, log):
+def run_batch(image_path, jobs, mode, gpu, output_path, model_path, cache_path, link_path, log):
     """
     Runs AlphaFold3 on a batch of jobs in one container. Returns the predictions that were
     obtained as (json_path, json_hash, seed, sample, results_path) and the unfinished jobs.
@@ -120,7 +119,8 @@ def run_batch(jobs, mode, gpu, output_path, model_path, cache_path, link_path, l
             batch.append((f"job_{i}", job, af3))
 
         # The compilation cache is read-only: a model that alphafold3_init has not compiled is an error
-        cmd = docker_cmd(
+        cmd = container_cmd(
+            image_path,
             ["python", "run_alphafold.py", "--input_dir=/input", "--output_dir=/output", "--model_dir=/models",
              "--norun_data_pipeline", "--jax_compilation_cache_dir=/cache", *model_flags()],
             gpus=[gpu],
@@ -154,6 +154,7 @@ def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, batch_size):
 
     search_db_path, pred_db_path, model_path, public_path = get_data_paths(data_dir)
     cache_path, env_path = get_cache_paths(data_dir)
+    image_path = get_image_path(data_dir)
 
     if not pred_db_path.exists():
         error(f"Database at {pred_db_path} does not exist", fatal=True)
@@ -165,18 +166,18 @@ def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, batch_size):
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    failed = predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, log_file, seeds, gpus, batch_size)
+    failed = predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size)
     for json_path in failed:
         error(f"No predictions were obtained for {json_path}")
     if failed:
         error("Something went wrong", fatal=True)
     all_done()
 
-def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, log_file, seeds, gpus, batch_size):
+def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size):
     """Predicts structures for json_paths (stem -> path). Returns the paths that failed."""
     recorded = read_environment(env_path)
     try:
-        current = probe_environment(gpus, model_path)
+        current = probe_environment(gpus, model_path, image_path)
     except RuntimeError as e:
         error(str(e), fatal=True)
     mismatches = compare_environment(recorded, current)
@@ -217,7 +218,7 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
         # Each bucket runs under the memory mode it was compiled with
         pending = {"normal": [], "unified": []}
         needed = set()
-        for job, record in zip(jobs, count_tokens(jobs, log) if jobs else []):
+        for job, record in zip(jobs, count_tokens(image_path, jobs, log) if jobs else []):
             if "error" in record:
                 error(f"{job.json_path}: {record['error']}")
                 continue
@@ -228,7 +229,7 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
             pending[compiled[bucket][0]].append(job)
             needed.add(bucket)
 
-        link_paths = link_compiled(sorted(needed), compiled, recorded["compiled_on"], gpus, Path(links_dir), model_path, log) if needed else {}
+        link_paths = link_compiled(image_path, sorted(needed), compiled, gpus, Path(links_dir), model_path, log) if needed else {}
 
         # Normal memory batches run on all GPUs. Unified memory batches spill into host RAM: they
         # come after all normal ones and only one runs at a time.
@@ -257,7 +258,7 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
             while (item := next_batch()) is not None:
                 mode, batch = item
                 try:
-                    results, unfinished = run_batch(batch, mode, gpu, output_path, model_path, cache_path, link_paths[gpu], log)
+                    results, unfinished = run_batch(image_path, batch, mode, gpu, output_path, model_path, cache_path, link_paths[gpu], log)
                 except Exception as e:
                     error(f"Got exception: {e}")
                     results, unfinished = [], batch

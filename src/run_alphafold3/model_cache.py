@@ -2,7 +2,7 @@ import json
 import subprocess
 import tempfile
 
-from run_alphafold3.utils import docker_cmd, model_flags
+from run_alphafold3.utils import container_cmd, model_flags
 from run_alphafold3.logger import error
 
 # Runs inside the AlphaFold3 container. For each bucket, smallest first, a poly-Ala chain of the
@@ -132,8 +132,9 @@ for bucket in (int(b) for b in args.buckets.split(",")):
     del compiled
 """
 
-def warm_cmd(buckets, env, gpu, model_path, cache_path, extra=[]):
-    return docker_cmd(
+def warm_cmd(image_path, buckets, env, gpu, model_path, cache_path, extra=[]):
+    return container_cmd(
+        image_path,
         ["python", "-c", WARM_SCRIPT, "--model_dir=/models", "--jax_compilation_cache_dir=/cache",
          f"--buckets={','.join(map(str, buckets))}", *extra, *model_flags()],
         gpus=[gpu],
@@ -141,7 +142,7 @@ def warm_cmd(buckets, env, gpu, model_path, cache_path, extra=[]):
         env=env,
     )
 
-def cache_keys(buckets, gpu, model_path, log):
+def cache_keys(image_path, buckets, gpu, model_path, log):
     """
     File names under which run_alphafold.py looks up the compiled model on this GPU, without
     compiling. They do not depend on the memory mode or on the cache contents, and need little
@@ -149,7 +150,7 @@ def cache_keys(buckets, gpu, model_path, log):
     cache is a scratch one, mounted at the same path as the real one.
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
-        cmd = warm_cmd(buckets, {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, gpu, model_path, tmp_dir, ["--key_only"])
+        cmd = warm_cmd(image_path, buckets, {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, gpu, model_path, tmp_dir, ["--key_only"])
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=log, text=True)
     keys = {}
     for line in proc.stdout.splitlines():

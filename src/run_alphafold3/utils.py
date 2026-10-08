@@ -17,7 +17,6 @@ from run_alphafold3.logger import error
 # --- Constants ---
 NUM_SAMPLES = 5
 ALT_ALNS = 10
-AF3_IMAGE = "alphafold3"
 
 SEARCHES_SCHEMA = [
     "CREATE TABLE IF NOT EXISTS proteins (seq_hash TEXT PRIMARY KEY, seq TEXT UNIQUE NOT NULL)",
@@ -57,19 +56,22 @@ def model_flags():
         f"--flash_attention_implementation={FLASH_ATTENTION}",
     ]
 
-def docker_cmd(args, gpus=None, volumes={}, env={}):
+def container_cmd(image_path, args, gpus=None, volumes={}, env={}):
     """
-    Builds a `docker run` command line for the AlphaFold3 image.
-    volumes maps host paths to container paths (append ":ro" to mount read-only).
+    Builds an `apptainer exec` command line for the AlphaFold3 image.
+    volumes maps host paths to container paths (append ":ro" to bind read-only).
+    The host environment and home directory are kept out of the container, so that it only
+    sees the image's own environment and Python packages.
     """
-    cmd = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}"]
+    cmd = ["apptainer", "exec", "--cleanenv", "--no-home", "--pwd", "/app/alphafold"]
     for host_path, container_path in volumes.items():
-        cmd += ["--volume", f"{host_path}:{container_path}"]
+        cmd += ["--bind", f"{host_path}:{container_path}"]
     if gpus is not None:
-        cmd += ["--gpus", "all", "--env", f"CUDA_VISIBLE_DEVICES={','.join(gpus)}"]
+        cmd += ["--nv"]
+        env = {"CUDA_VISIBLE_DEVICES": ",".join(gpus), **env}
     for key, val in env.items():
         cmd += ["--env", f"{key}={val}"]
-    return cmd + [AF3_IMAGE] + list(args)
+    return cmd + [str(image_path)] + list(args)
 
 def detect_compute_gpus():
     """
@@ -176,6 +178,13 @@ def get_cache_paths(data_dir):
     cache_path = data_path / "jax_cache"
     env_path = data_path / "environment.txt"
     return cache_path, env_path
+
+def get_image_path(data_dir, must_exist=True):
+    """The AlphaFold3 Apptainer image, created by alphafold3_init."""
+    image_path = Path(data_dir).resolve() / "alphafold3.sif"
+    if must_exist and not image_path.is_file():
+        error(f"No AlphaFold3 image at {image_path}: run alphafold3_init first", fatal=True)
+    return image_path
 
 def clean_record_seq(record_seq):
     return record_seq.upper().strip().replace("*", "").replace("-", "")

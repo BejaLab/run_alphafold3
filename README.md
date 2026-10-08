@@ -3,8 +3,8 @@
 A wrapper around [AlphaFold3](https://github.com/google-deepmind/alphafold3) that turns structure
 prediction into a scriptable, resumable pipeline.
 
-AlphaFold3 itself is run inside its official Docker image (`alphafold3`); this package takes care of
-everything around it:
+AlphaFold3 itself is run with [Apptainer](https://apptainer.org/), from an image built out of its
+official Docker image; this package takes care of everything around it:
 
 * **Input preparation** — build AlphaFold3 job JSONs from plain FASTA files, and combine them into
   homo- or hetero-oligomeric complexes.
@@ -22,11 +22,14 @@ The package installs eight command-line tools, all named `alphafold3_*`.
 ## Requirements
 
 * Python ≥ 3.12
-* [Docker](https://www.docker.com/) with an image tagged `alphafold3`
-  (built as described in the AlphaFold3 repository)
+* [Apptainer](https://apptainer.org/) on `$PATH`. On Ubuntu ≥ 23.10, which restricts unprivileged
+  user namespaces, install the system package (`ppa:apptainer/ppa`), which comes with the AppArmor
+  profile it needs; an Apptainer from conda cannot run containers there
+* The AlphaFold3 Docker image (built as described in the AlphaFold3 repository), or any other
+  source `apptainer build` accepts — only for `alphafold3_init` to build the Apptainer image
 * AlphaFold3 model weights and public sequence databases (see *Data directory* below)
 * [`hhalign`](https://github.com/soedinglab/hh-suite) on `$PATH` — only for `alphafold3_search_mod`
-* NVIDIA GPU(s) with drivers and the container toolkit — for `alphafold3_init` and `alphafold3_predict`
+* NVIDIA GPU(s) with drivers — for `alphafold3_init` and `alphafold3_predict`
 
 ## Installation
 
@@ -36,6 +39,45 @@ pip install git+https://github.com/BejaLab/run_alphafold3
 
 Python dependencies (`gemmi`, `tqdm`, `biopython`) are installed automatically.
 
+## Setup
+
+1. Install Apptainer. On Ubuntu:
+
+   ```bash
+   sudo add-apt-repository -y ppa:apptainer/ppa
+   sudo apt update
+   sudo apt install -y apptainer
+   ```
+
+   Make sure no other `apptainer` (e.g. from conda) comes first on `$PATH`.
+
+2. Build the AlphaFold3 Docker image from the AlphaFold3 repository. The labels are optional and end
+   up in `environment.txt`:
+
+   ```bash
+   git clone --branch v3.0.4 https://github.com/google-deepmind/alphafold3
+   cd alphafold3
+   docker build -t alphafold3 -f docker/Dockerfile \
+       --label alphafold3.commit=$(git rev-parse HEAD) --label alphafold3.version=v3.0.4 .
+   ```
+
+   Docker is only needed for `alphafold3_init` to build the Apptainer image; to build it elsewhere,
+   save the image with `docker save alphafold3 -o alphafold3.tar` and pass
+   `--image-source docker-archive://alphafold3.tar` to `alphafold3_init`.
+
+3. Put the model weights into `<data-dir>/models/` and the sequence databases into
+   `<data-dir>/public_databases/` (see *Data directory* below).
+
+4. Build the image, create the databases and compile the model, then test the prediction:
+
+   ```bash
+   alphafold3_init -D <data-dir> -l init.log
+   alphafold3_predict_test -D <data-dir>
+   ```
+
+To update AlphaFold3, rebuild the Docker image, delete `<data-dir>/alphafold3.sif` and run
+`alphafold3_init` again. `alphafold3_predict` refuses to run until then.
+
 ## Data directory
 
 Most tools take `-D/--data-dir`, a single directory holding everything persistent:
@@ -44,6 +86,7 @@ Most tools take `-D/--data-dir`, a single directory holding everything persisten
 <data-dir>/
 ├── searches.sq3        # cached MSAs and templates, keyed by sequence hash
 ├── predictions.sq3     # cached structures and confidences, keyed by job hash
+├── alphafold3.sif      # AlphaFold3 Apptainer image
 ├── jax_cache/          # compiled AlphaFold3 model, one entry per bucket size
 ├── environment.txt     # what the compiled model and the predictions depend on
 ├── models/             # AlphaFold3 model weights
@@ -51,6 +94,23 @@ Most tools take `-D/--data-dir`, a single directory holding everything persisten
 ```
 
 `models/` and `public_databases/` must be provided by the user; everything else is created by `alphafold3_init`.
+
+`alphafold3_search` makes the top-level directory of `public_databases/` (e.g. `/data` for
+`/data/af3/public_databases`) visible inside the container, so that links inside
+`public_databases/` resolve; they must point within that same top-level directory.
+
+Several data directories can share the image, the compiled model and the weights, e.g. to search
+against different sequence databases while keeping the caches apart. Keep the real files in one
+data directory and link to them from the others:
+
+```bash
+cd <other-data-dir>
+ln -s <data-dir>/alphafold3.sif <data-dir>/jax_cache <data-dir>/environment.txt <data-dir>/models .
+```
+
+`searches.sq3`, `predictions.sq3` and `public_databases/` stay separate, as they depend on the
+databases. Run `alphafold3_init` only in the data directory holding the real files: it re-creates
+`jax_cache/` and `environment.txt`, which the links then follow.
 
 ## Typical pipeline
 
@@ -89,7 +149,9 @@ Predictions land in `<output>/<query>/seed-<seed>_sample-<sample>/`, five sample
 
 ### `alphafold3_init` — initialize the database and compile the model
 
-Creates the data directory and the two SQLite caches, then compiles the AlphaFold3 model for each
+Creates the data directory and the two SQLite caches, builds the AlphaFold3 Apptainer image
+`alphafold3.sif` unless it is already there (from `--image-source`, by default the local Docker
+image `alphafold3:latest`; delete the image to rebuild it), then compiles the AlphaFold3 model for each
 of AlphaFold3's bucket sizes (inputs are padded to the smallest bucket that fits them) and stores
 the result in `jax_cache/`. Compilation dominates the run time of a small prediction and is done
 here once, so that `alphafold3_predict` only loads the compiled model. Using the same compiled model
@@ -103,20 +165,25 @@ the available GPU and host memory. The outcome and timing of each attempt are pr
 the compilation itself from the overhead of the container run.
 
 `environment.txt` records what the compiled model and the predictions depend on: the AlphaFold3
-version and Docker image, JAX, XLA flags, the GPU model and driver, the model weights and
+version and image, JAX, XLA flags, the GPU model and driver, the model weights and
 settings and the bucket sizes, as well as the memory mode and the cache entry of each compiled
 bucket and the GPU it was compiled on. Run `alphafold3_init` again whenever any of this changes;
 `alphafold3_predict` refuses to run otherwise. The compiled model can be used on any GPU of the
 same model (see `alphafold3_predict`).
 
 ```
-usage: alphafold3_init [-h] -D DATA_DIR [-g GPUS] [-l LOG] [--overwrite]
+usage: alphafold3_init [-h] -D DATA_DIR [-g GPUS] [-l LOG] [--image-source IMAGE_SOURCE]
+                       [--overwrite]
 
-  -D, --data-dir DATA_DIR   Base directory for data
-  -g, --gpus GPUS           GPUs, all of the same model; the first one is used for compilation
-                            (default: all detected, comma-separated)
-  -l, --log LOG             Raw log file
-      --overwrite           Over-write the database files if exist
+  -D, --data-dir DATA_DIR       Base directory for data
+  -g, --gpus GPUS               GPUs, all of the same model; the first one is used for
+                                compilation (default: all detected, comma-separated)
+  -l, --log LOG                 Raw log file
+      --image-source IMAGE_SOURCE
+                                Source to build the AlphaFold3 image from, if there is none in
+                                the data directory, in any form accepted by `apptainer build`
+                                (default: docker-daemon://alphafold3:latest)
+      --overwrite               Over-write the database files if exist
 ```
 
 ### `alphafold3_json` — convert FASTA to JSON
@@ -200,11 +267,11 @@ was compiled with. Jobs larger than the largest compiled bucket are rejected. Ba
 memory mode run in parallel on all GPUs; batches in unified memory mode come after them and run one
 at a time, since they share host RAM. If a batch fails, its unfinished jobs are retried one by one.
 
-JAX keys compiled models by the physical GPU, but GPUs of the same model run the same compiled
-model. For each GPU, the compiled model of the buckets needed is linked under that GPU's cache keys
-in a temporary directory, which is used as the compilation cache; computing the keys takes a short
-container run per GPU, except for the GPU `alphafold3_init` compiled on. All GPUs thus run the
-same compiled model and give identical results.
+JAX keys compiled models by the physical GPU and the container runtime, but GPUs of the same model
+run the same compiled model. For each GPU, the compiled model of the buckets needed is linked under
+that GPU's cache keys in a temporary directory, which is used as the compilation cache; computing
+the keys takes a short container run per GPU (in parallel). All GPUs thus run the same compiled
+model and give identical results.
 
 The compilation cache is mounted read-only, so a job never compiles the model. Every protein
 chain needs `unpairedMsa`, `pairedMsa` and `templates` and every RNA chain `unpairedMsa`

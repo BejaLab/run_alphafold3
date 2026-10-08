@@ -2,7 +2,7 @@ import json
 import hashlib
 import subprocess
 
-from run_alphafold3.utils import AF3_IMAGE, docker_cmd, model_flags
+from run_alphafold3.utils import container_cmd, model_flags
 
 # Runs inside the AlphaFold3 container
 PROBE_SCRIPT = """
@@ -30,13 +30,20 @@ def weights_digest(model_path):
             digest.update(hashlib.file_digest(f, 'sha256').digest())
     return digest.hexdigest()
 
-def probe_environment(gpus, model_path):
+def image_identity(image_path):
+    """The unique ID that Apptainer assigns to each image it builds, and the image's labels."""
+    header = subprocess.check_output(["apptainer", "sif", "header", str(image_path)], text=True)
+    sif_id = next(line.split(":", 1)[1].strip() for line in header.splitlines() if line.strip().startswith("ID:"))
+    inspect = json.loads(subprocess.check_output(["apptainer", "inspect", "--json", "--labels", str(image_path)]))
+    return sif_id, inspect["data"]["attributes"]["labels"] or {}
+
+def probe_environment(gpus, model_path, image_path):
     """
     Collects everything that determines the compiled model, and hence the predictions:
     the AlphaFold3/JAX build, XLA flags, GPU model and driver, model weights, model flags
     and AlphaFold3's bucket sizes. Raises RuntimeError if the GPUs are not all the same model.
     """
-    cmd = docker_cmd(["python", "-c", PROBE_SCRIPT], gpus=gpus, env={"XLA_PYTHON_CLIENT_PREALLOCATE": "false"})
+    cmd = container_cmd(image_path, ["python", "-c", PROBE_SCRIPT], gpus=gpus, env={"XLA_PYTHON_CLIENT_PREALLOCATE": "false"})
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"Could not probe the AlphaFold3 container:\n{proc.stderr}")
@@ -51,13 +58,12 @@ def probe_environment(gpus, model_path):
     )
     drivers = smi.split()
 
-    image = json.loads(subprocess.check_output(["docker", "image", "inspect", AF3_IMAGE]))[0]
-    labels = image["Config"].get("Labels") or {}
+    sif_id, labels = image_identity(image_path)
 
     return {
         "alphafold3_version": info["alphafold3"],
         "alphafold3_commit": labels.get("alphafold3.commit", "unknown"),
-        "docker_image": image["Id"],
+        "image_id": sif_id,
         "jax": info["jax"],
         "jaxlib": info["jaxlib"],
         "xla_backend": " ".join(info["platform_version"].split()),

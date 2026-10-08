@@ -1,4 +1,3 @@
-import os
 import argparse
 import subprocess
 import tempfile
@@ -9,11 +8,11 @@ from concurrent.futures import ThreadPoolExecutor as TPE
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import AF3_IMAGE, get_input_jsons, get_data_paths, get_seq_hash, fetch_search
+from run_alphafold3.utils import get_input_jsons, get_data_paths, get_image_path, get_seq_hash, fetch_search, container_cmd
 from run_alphafold3.classes import JSONpath, AF3json
 from run_alphafold3.logger import error, get_log, all_done
 
-def run_worker(seq_hash, sequence, public_path, threads, log):
+def run_worker(image_path, seq_hash, sequence, public_path, threads, log):
     top_dir = Path(public_path.parts[0], public_path.parts[1])
     output = None, None
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -22,25 +21,21 @@ def run_worker(seq_hash, sequence, public_path, threads, log):
         query_json = AF3json(data={"sequences": [{"protein": {"id": "A", "sequence": sequence}}]}, seeds=[1])
         query_json.write(json_path)
         
-        docker_cmd = [
-            "docker", "run",
-            "--user", f"{os.getuid()}:{os.getgid()}",
-            "--volume", f"{json_path}:/input.json",
-            "--volume", f"{tmp_path}:/output",
-            "--volume", f"{public_path}:/public_databases",
-            "--volume", f"{top_dir}:{top_dir}",
-            AF3_IMAGE, "sh", "-c",
-            f"python run_alphafold.py --json_path=/input.json --output_dir=/output --run_inference=false --jackhmmer_n_cpu {threads}"
-        ]
+        cmd = container_cmd(
+            image_path,
+            ["python", "run_alphafold.py", "--json_path=/input.json", "--output_dir=/output", "--db_dir=/public_databases",
+             "--run_inference=false", f"--jackhmmer_n_cpu={threads}"],
+            volumes={json_path: "/input.json", tmp_path: "/output", public_path: "/public_databases", top_dir: top_dir},
+        )
         try:
-            subprocess.run(docker_cmd, stdout=log, stderr=log, check=True)
+            subprocess.run(cmd, stdout=log, stderr=log, check=True)
             output_json = JSONpath(tmp_path / "query" / "query_data.json")
             if output_json.exists():
                 af3 = AF3json(output_json)
                 seq = next(af3.iter_seq())
                 output = seq['unpairedMsa'], seq['templates']
         except subprocess.CalledProcessError:
-            error("Docker command failed. Check log file.", fatal=True)
+            error("AlphaFold3 container failed. Check log file.", fatal=True)
             
     return output
 
@@ -50,6 +45,7 @@ def launch(input_val, output_dir, data_dir, log_file, workers, threads):
         error("No input files supplied", fatal=True)
 
     search_db_path, pred_db_path, model_path, public_path = get_data_paths(data_dir)
+    image_path = get_image_path(data_dir)
 
     if not search_db_path.exists():
         error(f"Database at {search_db_path} does not exist", fatal=True)
@@ -81,7 +77,7 @@ def launch(input_val, output_dir, data_dir, log_file, workers, threads):
         try:
             added = {}
             for seq_hash, sequence in missing.items():
-                added[seq_hash] = run_worker(seq_hash, sequence, public_path, threads, log)
+                added[seq_hash] = run_worker(image_path, seq_hash, sequence, public_path, threads, log)
             return json_path, present, added
         except Exception as e:
             error(f"Got exception: {e}")

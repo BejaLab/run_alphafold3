@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 import gemmi
 
-from run_alphafold3.utils import NUM_SAMPLES, PREDICTIONS_SCHEMA, get_data_paths, get_cache_paths, get_results_dir_path, get_results_files_paths, detect_compute_gpus
+from run_alphafold3.utils import NUM_SAMPLES, PREDICTIONS_SCHEMA, get_data_paths, get_cache_paths, get_image_path, get_results_dir_path, get_results_files_paths, detect_compute_gpus
 from run_alphafold3.classes import JSONpath
 from run_alphafold3.job_predict import predict
 from run_alphafold3.logger import error, all_done
@@ -18,7 +18,7 @@ TEST_NAME = "ubiquitin"
 TEST_SEQ = "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG"
 TEST_SEED = 1
 
-def test_gpu(gpu, tmp_path, json_path, model_path, cache_path, env_path, log_file):
+def test_gpu(gpu, tmp_path, json_path, model_path, cache_path, env_path, image_path, log_file):
     """Predicts the test protein on one GPU. Returns the coordinates and ranking score of each sample."""
     output_path = tmp_path / f"output_{gpu}"
     output_path.mkdir()
@@ -30,7 +30,7 @@ def test_gpu(gpu, tmp_path, json_path, model_path, cache_path, env_path, log_fil
 
     print(f"[*] Predicting {TEST_NAME} ({len(TEST_SEQ)} residues) on GPU {gpu}")
     start = time.time()
-    failed = predict({json_path.stem: json_path}, output_path, test_db_path, model_path, cache_path, env_path, log_file, None, [gpu], 1)
+    failed = predict({json_path.stem: json_path}, output_path, test_db_path, model_path, cache_path, env_path, image_path, log_file, None, [gpu], 1)
     elapsed = time.time() - start
     if failed:
         error(f"Prediction failed on GPU {gpu}. Check log file.", fatal=True)
@@ -61,6 +61,7 @@ def test_gpu(gpu, tmp_path, json_path, model_path, cache_path, env_path, log_fil
 def launch(data_dir, gpus, log_file):
     search_db_path, pred_db_path, model_path, public_path = get_data_paths(data_dir)
     cache_path, env_path = get_cache_paths(data_dir)
+    image_path = get_image_path(data_dir)
     if not model_path.exists():
         error(f"No models at {model_path}", fatal=True)
     if not env_path.exists() or not cache_path.exists():
@@ -78,7 +79,7 @@ def launch(data_dir, gpus, log_file):
         # One GPU at a time: all GPUs must load the same compiled model and give identical results
         reference = None
         for gpu in gpus:
-            samples = test_gpu(gpu, tmp_path, json_path, model_path, cache_path, env_path, log_file)
+            samples = test_gpu(gpu, tmp_path, json_path, model_path, cache_path, env_path, image_path, log_file)
             if reference is None:
                 reference = samples
             elif samples != reference:
