@@ -268,6 +268,18 @@ was compiled with. Jobs larger than the largest compiled bucket are rejected. Ba
 memory mode run in parallel on all GPUs; batches in unified memory mode come after them and run one
 at a time, since they share host RAM. If a batch fails, its unfinished jobs are retried one by one.
 
+Each batch locks its GPU, so that runs started at the same time, from any data directory, by any
+user and from any sandbox, take turns on a GPU instead of running out of memory: a batch on a GPU
+that is busy waits for it, with a message naming the PID that locked it. The lock is a `flock` on
+the GPU's device node (e.g. `/dev/nvidia0`), so any other command can take part with
+`flock /dev/nvidia0 <command>`. It is released between batches, and a run waiting for the GPU
+gets it before the run that released it takes it again, so that a short run does not wait for a
+long one to finish. After `--max-wait` seconds (43200, i.e. 12 hours, by default) of waiting,
+the run gives up on the GPU and leaves its batches to the other GPUs; jobs left when every GPU has
+been given up on fail. The container inherits the lock: the GPU stays locked while it runs, even
+if `alphafold3_predict` is killed, and is released by the kernel as soon as both are gone.
+`alphafold3_init` locks the GPU it compiles on in the same way, waiting for it for up to 12 hours.
+
 JAX keys compiled models by the physical GPU and the container runtime, but GPUs of the same model
 run the same compiled model. For each GPU, the compiled model of the buckets needed is linked under
 that GPU's cache keys in a temporary directory, which is used as the compilation cache; computing
@@ -281,7 +293,7 @@ chain needs `unpairedMsa`, `pairedMsa` and `templates` and every RNA chain `unpa
 ```
 usage: alphafold3_predict [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
                           [-g GPUS] [-b BATCH_SIZE] [-s SEEDS] [-l LOG]
-                          [--read-only-cache]
+                          [--max-wait MAX_WAIT] [--read-only-cache]
 
   -i, --input INPUT [INPUT ...]   Path to input json file(s) or a directory containing them
   -O, --output OUTPUT             Output directory
@@ -290,6 +302,7 @@ usage: alphafold3_predict [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
   -b, --batch-size BATCH_SIZE     Number of jobs per AlphaFold3 run (default: 10)
   -s, --seeds SEEDS               Seeds (overrides modelSeeds in json)
   -l, --log LOG                   Raw log file
+      --max-wait MAX_WAIT         Seconds to wait for a busy GPU before giving up on it (default: 43200, i.e. 12 hours)
       --read-only-cache           Use cached predictions, but do not add new ones to the cache
 ```
 

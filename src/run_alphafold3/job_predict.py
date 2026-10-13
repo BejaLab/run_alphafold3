@@ -12,6 +12,7 @@ from tqdm import tqdm
 from run_alphafold3.utils import NUM_SAMPLES, MEMORY_ENV, get_input_jsons, get_data_paths, get_cache_paths, fetch_pred, get_results_dir_path, get_results_files_paths, write_results, get_image_path, open_cache, container_cmd, model_flags, detect_compute_gpus
 from run_alphafold3.environment import probe_environment, read_environment, compare_environment, parse_compiled_buckets
 from run_alphafold3.model_cache import cache_keys
+from run_alphafold3.gpu_lock import gpu_lock, device_node, duration, GPUWaitTimeout, DEF_MAX_WAIT
 
 # XLA's autotuning results, kept in the compilation cache
 AUTOTUNE_DIR = "xla_gpu_per_fusion_autotune_cache_dir"
@@ -99,7 +100,7 @@ def link_compiled(image_path, buckets, compiled, gpus, links_path, model_path, l
             link_paths[gpu] = link_path
     return link_paths
 
-def run_batch(image_path, jobs, mode, gpu, output_path, model_path, cache_path, link_path, log):
+def run_batch(image_path, jobs, mode, gpu, output_path, model_path, cache_path, link_path, log, max_wait):
     """
     Runs AlphaFold3 on a batch of jobs in one container. Returns the predictions that were
     obtained as (json_path, json_hash, seed, sample, results_path) and the unfinished jobs.
@@ -127,7 +128,9 @@ def run_batch(image_path, jobs, mode, gpu, output_path, model_path, cache_path, 
                      cache_path: "/compiled:ro", link_path: "/cache:ro"},
             env={**MEMORY_ENV[mode], "JAX_RAISE_PERSISTENT_CACHE_ERRORS": "true"},
         )
-        subprocess.run(cmd, stdout=log, stderr=log)
+        # The container inherits the lock, so that the GPU stays locked while it runs, even if we die
+        with gpu_lock(gpu, max_wait) as lock_fd:
+            subprocess.run(cmd, stdout=log, stderr=log, pass_fds=[lock_fd])
 
         # A failing job stops the container, but the jobs before it are complete
         for name, job, af3 in batch:
@@ -146,7 +149,7 @@ def run_batch(image_path, jobs, mode, gpu, output_path, model_path, cache_path, 
                 unfinished.append(Job(job.json_path, missing))
     return results, unfinished
 
-def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, batch_size, read_only_cache=False):
+def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, batch_size, read_only_cache=False, max_wait=DEF_MAX_WAIT):
     json_paths = get_input_jsons(input_val)
     if not json_paths:
         error("No input files supplied", fatal=True)
@@ -165,14 +168,14 @@ def launch(input_val, output_dir, data_dir, log_file, seeds, gpus, batch_size, r
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    failed = predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size, read_only_cache)
+    failed = predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size, read_only_cache, max_wait)
     for json_path in failed:
         error(f"No predictions were obtained for {json_path}")
     if failed:
         error("Something went wrong", fatal=True)
     all_done()
 
-def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size, read_only_cache=False):
+def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_path, image_path, log_file, seeds, gpus, batch_size, read_only_cache=False, max_wait=DEF_MAX_WAIT):
     """
     Predicts structures for json_paths (stem -> path). Returns the paths that failed.
     With read_only_cache, uses cached predictions, but does not add new ones to the cache.
@@ -180,6 +183,8 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
     recorded = read_environment(env_path)
     try:
         current = probe_environment(gpus, model_path, image_path)
+        for gpu in gpus:
+            device_node(gpu)
     except RuntimeError as e:
         error(str(e), fatal=True)
     mismatches = compare_environment(recorded, current)
@@ -256,11 +261,25 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
                     state["active"] += 1
                     return mode, batch_queues[mode].popleft()
 
+        def release(mode):
+            # Called under cond
+            state["active"] -= 1
+            if mode == "unified":
+                state["unified_running"] = False
+            cond.notify_all()
+
         def worker(gpu):
             while (item := next_batch()) is not None:
                 mode, batch = item
                 try:
-                    results, unfinished = run_batch(image_path, batch, mode, gpu, output_path, model_path, cache_path, link_paths[gpu], log)
+                    results, unfinished = run_batch(image_path, batch, mode, gpu, output_path, model_path, cache_path, link_paths[gpu], log, max_wait)
+                except GPUWaitTimeout as e:
+                    # Give up on this GPU and leave the batch to the others
+                    error(str(e))
+                    with cond:
+                        batch_queues[mode].appendleft(batch)
+                        release(mode)
+                    break
                 except Exception as e:
                     error(f"Got exception: {e}")
                     results, unfinished = [], batch
@@ -272,10 +291,7 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
                     else:
                         for job in unfinished:
                             events.put(job)
-                    state["active"] -= 1
-                    if mode == "unified":
-                        state["unified_running"] = False
-                    cond.notify_all()
+                    release(mode)
             events.put(None)
 
         remaining = {str(job.json_path): set(job.seeds) for job in jobs}
@@ -317,13 +333,16 @@ def cli():
     parser.add_argument("-b", "--batch-size", type=int, default=DEF_BATCH_SIZE, help=f"Number of jobs per AlphaFold3 run (default: {DEF_BATCH_SIZE})")
     parser.add_argument("-s", "--seeds", type=set_of_int_arg, help="Seeds (overrides modelSeeds in json)")
     parser.add_argument("-l", "--log", type=str, help="Raw log file")
+    parser.add_argument("--max-wait", type=float, default=DEF_MAX_WAIT, help=f"Seconds to wait for a busy GPU before giving up on it (default: {DEF_MAX_WAIT}, i.e. {duration(DEF_MAX_WAIT)})")
     parser.add_argument("--read-only-cache", action="store_true", help="Use cached predictions, but do not add new ones to the cache")
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
+    if args.max_wait < 0:
+        parser.error("--max-wait must not be negative")
     launch(
         args.input, args.output, args.data_dir, args.log,
-        seeds=args.seeds, gpus=args.gpus, batch_size=args.batch_size, read_only_cache=args.read_only_cache
+        seeds=args.seeds, gpus=args.gpus, batch_size=args.batch_size, read_only_cache=args.read_only_cache, max_wait=args.max_wait
     )
 
 if __name__ == "__main__":

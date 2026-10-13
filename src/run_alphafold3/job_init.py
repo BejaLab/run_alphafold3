@@ -11,6 +11,7 @@ from tqdm import tqdm
 from run_alphafold3.utils import MEMORY_ENV, SEARCHES_SCHEMA, PREDICTIONS_SCHEMA, get_data_paths, get_cache_paths, get_image_path, detect_compute_gpus
 from run_alphafold3.environment import probe_environment, write_environment, gpu_uuids
 from run_alphafold3.model_cache import warm_cmd, cache_keys
+from run_alphafold3.gpu_lock import gpu_lock, GPUWaitTimeout
 from run_alphafold3.logger import error, get_log, all_done
 
 DEF_GPUS = detect_compute_gpus()
@@ -27,11 +28,11 @@ def host_memory_available():
             if line.startswith("MemAvailable:"):
                 return int(line.split()[1]) * 2**10
 
-def compile_buckets(image_path, buckets, mode, gpu, model_path, cache_path, log, progress_bar, previous=None):
+def compile_buckets(image_path, buckets, mode, gpu, model_path, cache_path, log, progress_bar, lock_fd, previous=None):
     """
     Compiles the model for the buckets in one container, smallest first, until one does not fit
     into memory. Adds the cache entries of those that fit to cache_path and returns
-    {bucket: (cache entry, peak memory)} for them.
+    {bucket: (cache entry, peak memory)} for them. The container inherits lock_fd, the GPU lock.
     """
     extra = []
     if mode == "unified":
@@ -46,7 +47,7 @@ def compile_buckets(image_path, buckets, mode, gpu, model_path, cache_path, log,
         start = time.time()
         compile_time = 0
         cmd = warm_cmd(image_path, buckets, MEMORY_ENV[mode], gpu, model_path, tmp_dir, extra)
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True) as proc:
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, pass_fds=[lock_fd]) as proc:
             for line in proc.stdout:
                 result = json.loads(line)
                 bucket = result["bucket"]
@@ -130,16 +131,20 @@ def launch(data_dir, gpus, log_file, image_source, overwrite = False):
         print(f"[*] Compiling the model on GPU {gpus[0]} ({env['gpu']})")
         buckets = [int(b) for b in env["buckets"].split(',')]
         compiled = {}
-        with tqdm(total=len(buckets)) as progress_bar:
-            previous = None
-            for mode in ["normal", "unified"]:
-                remaining = [b for b in buckets if b not in compiled]
-                if not remaining:
-                    break
-                fitted = compile_buckets(image_path, remaining, mode, gpus[0], model_path, cache_path, log, progress_bar, previous)
-                for bucket, (entry, peak) in fitted.items():
-                    compiled[bucket] = mode, entry
-                    previous = bucket, peak
+        # Measuring what fits into memory needs the GPU to itself
+        try:
+            with gpu_lock(gpus[0]) as lock_fd, tqdm(total=len(buckets)) as progress_bar:
+                previous = None
+                for mode in ["normal", "unified"]:
+                    remaining = [b for b in buckets if b not in compiled]
+                    if not remaining:
+                        break
+                    fitted = compile_buckets(image_path, remaining, mode, gpus[0], model_path, cache_path, log, progress_bar, lock_fd, previous)
+                    for bucket, (entry, peak) in fitted.items():
+                        compiled[bucket] = mode, entry
+                        previous = bucket, peak
+        except GPUWaitTimeout as e:
+            error(str(e), fatal=True)
 
         if not compiled:
             error("The model does not fit into memory even for the smallest bucket", fatal=True)
