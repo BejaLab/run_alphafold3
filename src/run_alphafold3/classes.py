@@ -52,6 +52,9 @@ class AF3json:
             for item in seq:
                 id_val = seq[item].get('id', [])
                 seq[item]['id'] = list(it.islice(self.ids, oligomer * len(id_val)))
+                if item in ('protein', 'rna', 'dna'):
+                    # AlphaFold3 maps lower-case residues to UNK
+                    seq[item]['sequence'] = seq[item]['sequence'].upper()
                 if item == 'protein':
                     self.len += len(id_val) * len(seq[item]['sequence'])
                     if 'templates' not in seq[item]:
