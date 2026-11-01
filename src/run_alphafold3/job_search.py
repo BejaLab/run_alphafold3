@@ -76,7 +76,7 @@ def launch(input_val, output_dir, data_dir, log_file, workers, threads, read_onl
         try:
             added = {}
             for seq_hash, sequence in missing.items():
-                added[seq_hash] = run_worker(image_path, seq_hash, sequence, public_path, threads, log)
+                added[seq_hash] = sequence, run_worker(image_path, seq_hash, sequence, public_path, threads, log)
             return json_path, present, added
         except Exception as e:
             error(f"Got exception: {e}")
@@ -89,7 +89,8 @@ def launch(input_val, output_dir, data_dir, log_file, workers, threads, read_onl
             for future in futures_done:
                 json_path, present, added = future.result()
                 if not read_only_cache:
-                    for seq_hash, (unpaired_msa, templates) in added.items():
+                    for seq_hash, (sequence, (unpaired_msa, templates)) in added.items():
+                        conn.execute("INSERT OR IGNORE INTO proteins VALUES (?, ?)", (seq_hash, sequence))
                         conn.execute("INSERT OR IGNORE INTO searches VALUES (?, ?, ?)", (seq_hash, unpaired_msa, json.dumps(templates)))
                     conn.commit()
                 af3 = AF3json(json_path)
@@ -100,7 +101,7 @@ def launch(input_val, output_dir, data_dir, log_file, workers, threads, read_onl
                         seq['unpairedMsa'], seq['templates'] = present[seq_hash]
                         seq['pairedMsa'] = ""
                     elif seq_hash in added:
-                        seq['unpairedMsa'], seq['templates'] = added[seq_hash]
+                        seq['unpairedMsa'], seq['templates'] = added[seq_hash][1]
                         seq['pairedMsa'] = ""
                     else:
                         raise ValueError(f"Something went wrong: templates and MSAs not generated for: {sequence}")
