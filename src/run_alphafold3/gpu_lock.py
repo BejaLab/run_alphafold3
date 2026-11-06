@@ -50,6 +50,10 @@ def duration(seconds):
             return f"{seconds / size:.3g} {unit}"
     return f"{seconds:.3g} s"
 
+def lock_fds(lock_fd):
+    """The descriptors to pass to a child for it to hold the lock yielded by gpu_lock."""
+    return [] if lock_fd is None else [lock_fd]
+
 def locked_by(path):
     holder = lock_holder(path)
     if holder is None:
@@ -59,7 +63,7 @@ def locked_by(path):
     return f" (locked by PID {holder}, which has exited, but a process it started still runs)"
 
 @contextmanager
-def gpu_lock(gpu, max_wait=DEF_MAX_WAIT):
+def gpu_lock(gpu, max_wait=DEF_MAX_WAIT, enabled=True):
     """
     Holds a GPU among the processes that take this lock, waiting while another one holds it, for
     up to max_wait seconds, after which GPUWaitTimeout is raised.
@@ -74,7 +78,13 @@ def gpu_lock(gpu, max_wait=DEF_MAX_WAIT):
     A process that has to wait first queues on a turnstile, an exclusive lock on the first byte of
     the device node. A process that releases the GPU and wants it back has to pass the turnstile,
     which lets the waiting process in first.
+
+    With enabled=False, takes no lock and yields None: for a scheduler that already gives the
+    GPU to one job, such as SLURM.
     """
+    if not enabled:
+        yield None
+        return
     path = device_node(gpu)
     lock_fd = os.open(path, os.O_RDONLY)
     try:

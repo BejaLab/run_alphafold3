@@ -173,7 +173,7 @@ same model (see `alphafold3_predict`).
 
 ```
 usage: alphafold3_init [-h] -D DATA_DIR [-g GPUS] [-l LOG] [--image-source IMAGE_SOURCE]
-                       [--overwrite]
+                       [--overwrite] [--no-gpu-lock]
 
   -D, --data-dir DATA_DIR       Base directory for data
   -g, --gpus GPUS               GPUs, all of the same model; the first one is used for
@@ -184,6 +184,8 @@ usage: alphafold3_init [-h] -D DATA_DIR [-g GPUS] [-l LOG] [--image-source IMAGE
                                 the data directory, in any form accepted by `apptainer build`
                                 (default: docker-daemon://alphafold3:latest)
       --overwrite               Over-write the database files if exist
+      --no-gpu-lock             Do not lock the GPU compiled on: for when a scheduler such as
+                                SLURM already gives it to this run alone
 ```
 
 ### `alphafold3_json` — convert FASTA to JSON
@@ -280,6 +282,12 @@ been given up on fail. The container inherits the lock: the GPU stays locked whi
 if `alphafold3_predict` is killed, and is released by the kernel as soon as both are gone.
 `alphafold3_init` locks the GPU it compiles on in the same way, waiting for it for up to 12 hours.
 
+Under a scheduler that gives the GPUs to one job, such as SLURM, the lock is not needed and can be
+skipped with `--no-gpu-lock` (in both `alphafold3_predict` and `alphafold3_init`). It should be: a
+container that is killed, e.g. for running out of memory, can leave behind a process that inherited
+the lock (such as Apptainer's `squashfuse_ll`), which keeps the GPU locked until the job ends, so
+that the run waits `--max-wait` for a GPU that is in fact free.
+
 JAX keys compiled models by the physical GPU and the container runtime, but GPUs of the same model
 run the same compiled model. For each GPU, the compiled model of the buckets needed is linked under
 that GPU's cache keys in a temporary directory, which is used as the compilation cache; computing
@@ -293,7 +301,7 @@ chain needs `unpairedMsa`, `pairedMsa` and `templates` and every RNA chain `unpa
 ```
 usage: alphafold3_predict [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
                           [-g GPUS] [-b BATCH_SIZE] [-s SEEDS] [-l LOG]
-                          [--max-wait MAX_WAIT] [--read-only-cache]
+                          [--max-wait MAX_WAIT] [--no-gpu-lock] [--read-only-cache]
 
   -i, --input INPUT [INPUT ...]   Path to input json file(s) or a directory containing them
   -O, --output OUTPUT             Output directory
@@ -303,6 +311,7 @@ usage: alphafold3_predict [-h] -i INPUT [INPUT ...] -O OUTPUT -D DATA_DIR
   -s, --seeds SEEDS               Seeds (overrides modelSeeds in json)
   -l, --log LOG                   Raw log file
       --max-wait MAX_WAIT         Seconds to wait for a busy GPU before giving up on it (default: 43200, i.e. 12 hours)
+      --no-gpu-lock               Do not lock the GPUs: for when a scheduler such as SLURM already gives them to this run alone
       --read-only-cache           Use cached predictions, but do not add new ones to the cache
 ```
 

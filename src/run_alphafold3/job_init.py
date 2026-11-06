@@ -11,7 +11,7 @@ from tqdm import tqdm
 from run_alphafold3.utils import MEMORY_ENV, SEARCHES_SCHEMA, PREDICTIONS_SCHEMA, get_data_paths, get_cache_paths, get_image_path, detect_compute_gpus
 from run_alphafold3.environment import probe_environment, write_environment, gpu_uuids
 from run_alphafold3.model_cache import warm_cmd, cache_keys
-from run_alphafold3.gpu_lock import gpu_lock, GPUWaitTimeout
+from run_alphafold3.gpu_lock import gpu_lock, lock_fds, GPUWaitTimeout
 from run_alphafold3.logger import error, get_log, all_done
 
 DEF_GPUS = detect_compute_gpus()
@@ -32,7 +32,7 @@ def compile_buckets(image_path, buckets, mode, gpu, model_path, cache_path, log,
     """
     Compiles the model for the buckets in one container, smallest first, until one does not fit
     into memory. Adds the cache entries of those that fit to cache_path and returns
-    {bucket: (cache entry, peak memory)} for them. The container inherits lock_fd, the GPU lock.
+    {bucket: (cache entry, peak memory)} for them. The container inherits lock_fd, the GPU lock, if any.
     """
     extra = []
     if mode == "unified":
@@ -47,7 +47,7 @@ def compile_buckets(image_path, buckets, mode, gpu, model_path, cache_path, log,
         start = time.time()
         compile_time = 0
         cmd = warm_cmd(image_path, buckets, MEMORY_ENV[mode], gpu, model_path, tmp_dir, extra)
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, pass_fds=[lock_fd]) as proc:
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True, pass_fds=lock_fds(lock_fd)) as proc:
             for line in proc.stdout:
                 result = json.loads(line)
                 bucket = result["bucket"]
@@ -80,7 +80,7 @@ def compile_buckets(image_path, buckets, mode, gpu, model_path, cache_path, log,
             shutil.copytree(autotune_dir, cache_path / autotune_dir.name, dirs_exist_ok=True)
     return fitted
 
-def launch(data_dir, gpus, log_file, image_source, overwrite = False):
+def launch(data_dir, gpus, log_file, image_source, overwrite = False, lock_gpu = True):
     search_db_path, pred_db_path, model_path, public_path = get_data_paths(data_dir, create=True)
     cache_path, env_path = get_cache_paths(data_dir)
     print(f"[*] Initializing the database")
@@ -133,7 +133,7 @@ def launch(data_dir, gpus, log_file, image_source, overwrite = False):
         compiled = {}
         # Measuring what fits into memory needs the GPU to itself
         try:
-            with gpu_lock(gpus[0]) as lock_fd, tqdm(total=len(buckets)) as progress_bar:
+            with gpu_lock(gpus[0], enabled=lock_gpu) as lock_fd, tqdm(total=len(buckets)) as progress_bar:
                 previous = None
                 for mode in ["normal", "unified"]:
                     remaining = [b for b in buckets if b not in compiled]
@@ -177,8 +177,9 @@ def cli():
     parser.add_argument("-l", "--log", type=str, help="Raw log file")
     parser.add_argument("--image-source", default=DEF_IMAGE_SOURCE, help=f"Source to build the AlphaFold3 image from, if there is none in the data directory, in any form accepted by `apptainer build` [{DEF_IMAGE_SOURCE}]")
     parser.add_argument("--overwrite", action = 'store_true', help="Over-write the database files if exist")
+    parser.add_argument("--no-gpu-lock", action = 'store_true', help="Do not lock the GPU compiled on: for when a scheduler such as SLURM already gives it to this run alone")
     args = parser.parse_args()
-    launch(args.data_dir, args.gpus, args.log, args.image_source, overwrite = args.overwrite)
+    launch(args.data_dir, args.gpus, args.log, args.image_source, overwrite = args.overwrite, lock_gpu = not args.no_gpu_lock)
 
 if __name__ == "__main__":
     cli()
