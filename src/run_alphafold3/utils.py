@@ -22,8 +22,11 @@ SEARCHES_SCHEMA = [
     "CREATE TABLE IF NOT EXISTS proteins (seq_hash TEXT PRIMARY KEY, seq TEXT UNIQUE NOT NULL)",
     "CREATE TABLE IF NOT EXISTS searches (seq_hash TEXT, unpaired_msa TEXT, templates TEXT, PRIMARY KEY (seq_hash))",
 ]
+# env_hash names the environment (see environment.py) that a prediction was made in; it is NULL
+# for predictions cached before it was recorded
 PREDICTIONS_SCHEMA = [
-    "CREATE TABLE IF NOT EXISTS predictions (json_hash TEXT, seed INT, sample INT, cif TEXT, summary TEXT, confidences TEXT, PRIMARY KEY (json_hash, seed, sample))",
+    "CREATE TABLE IF NOT EXISTS predictions (json_hash TEXT, seed INT, sample INT, cif TEXT, summary TEXT, confidences TEXT, env_hash TEXT, PRIMARY KEY (json_hash, seed, sample))",
+    "CREATE TABLE IF NOT EXISTS environments (env_hash TEXT PRIMARY KEY, environment TEXT NOT NULL)",
 ]
 
 # Settings that change the compiled model: alphafold3_init warms the JAX compilation cache
@@ -188,6 +191,23 @@ def open_cache(db_path, read_only=False):
     except sqlite3.OperationalError as e:
         error(f"Cannot read {db_path} read-only ({e}). A writer that crashed may have left a journal, which only a writer can roll back: run once without --read-only-cache", fatal=True)
     return conn
+
+def init_predictions_db(conn):
+    """
+    Creates the tables of the predictions cache, and adds the env_hash column to a cache made
+    before it existed: adding a column does not rewrite the table, and the old rows read NULL.
+    """
+    for statement in PREDICTIONS_SCHEMA:
+        conn.execute(statement)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(predictions)")]
+    if "env_hash" not in columns:
+        try:
+            conn.execute("ALTER TABLE predictions ADD COLUMN env_hash TEXT")
+        except sqlite3.OperationalError as e:
+            # Another run sharing the cache added it first
+            if "duplicate column" not in str(e):
+                raise
+    conn.commit()
 
 def get_cache_paths(data_dir):
     data_path = Path(data_dir).resolve()

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import MEMORY_ENV, SEARCHES_SCHEMA, PREDICTIONS_SCHEMA, get_data_paths, get_cache_paths, get_image_path, detect_compute_gpus
+from run_alphafold3.utils import MEMORY_ENV, SEARCHES_SCHEMA, init_predictions_db, get_data_paths, get_cache_paths, get_image_path, detect_compute_gpus
 from run_alphafold3.environment import probe_environment, write_environment, gpu_uuids
 from run_alphafold3.model_cache import warm_cmd, cache_keys
 from run_alphafold3.gpu_lock import gpu_lock, lock_fds, GPUWaitTimeout
@@ -92,8 +92,7 @@ def launch(data_dir, gpus, log_file, image_source, overwrite = False, lock_gpu =
         for statement in SEARCHES_SCHEMA:
             conn.execute(statement)
     with sqlite3.connect(pred_db_path) as conn:
-        for statement in PREDICTIONS_SCHEMA:
-            conn.execute(statement)
+        init_predictions_db(conn)
 
     if not model_path.exists():
         error(f"No models at {model_path}", fatal=True)

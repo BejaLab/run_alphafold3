@@ -85,7 +85,7 @@ Most tools take `-D/--data-dir`, a single directory holding everything persisten
 ```
 <data-dir>/
 ├── searches.sq3        # cached MSAs and templates, keyed by sequence hash
-├── predictions.sq3     # cached structures and confidences, keyed by job hash
+├── predictions.sq3     # cached structures and confidences, keyed by job hash, and the environment of each
 ├── alphafold3.sif      # AlphaFold3 Apptainer image
 ├── jax_cache/          # compiled AlphaFold3 model, one entry per bucket size
 ├── environment.txt     # what the compiled model and the predictions depend on
@@ -293,6 +293,20 @@ run the same compiled model. For each GPU, the compiled model of the buckets nee
 that GPU's cache keys in a temporary directory, which is used as the compilation cache; computing
 the keys takes a short container run per GPU (in parallel). All GPUs thus run the same compiled
 model and give identical results.
+
+Each prediction in `predictions.sq3` records the environment it was made in, as `env_hash`: a
+hash of the entries of `environment.txt` that the predictions depend on (everything but the cache
+entries of the compiled buckets and the GPU they were compiled on), so that it is the same for
+every GPU of a model and every `alphafold3_init` in the same setup. The table `environments` holds
+those entries as JSON for each hash:
+
+```sql
+SELECT e.environment, COUNT(*) FROM predictions p LEFT JOIN environments e USING (env_hash) GROUP BY p.env_hash;
+```
+
+Cached predictions are used whatever environment they were made in. Caches made before
+`env_hash` existed get the column on their first write; their earlier predictions have no
+environment (`NULL`).
 
 The compilation cache is mounted read-only, so a job never compiles the model. Every protein
 chain needs `unpairedMsa`, `pairedMsa` and `templates` and every RNA chain `unpairedMsa`

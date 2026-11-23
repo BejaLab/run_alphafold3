@@ -1,4 +1,5 @@
 import json
+import base64
 import hashlib
 import subprocess
 
@@ -60,7 +61,7 @@ def probe_environment(gpus, model_path, image_path):
 
     sif_id, labels = image_identity(image_path)
 
-    return {
+    env = {
         "alphafold3_version": info["alphafold3"],
         "alphafold3_commit": labels.get("alphafold3.commit", "unknown"),
         "image_id": sif_id,
@@ -74,6 +75,25 @@ def probe_environment(gpus, model_path, image_path):
         "model_flags": " ".join(model_flags()),
         "buckets": ",".join(map(str, info["buckets"])),
     }
+    assert tuple(env) == PROBED_KEYS
+    return env
+
+# The keys of probe_environment(): what the predictions depend on. environment.txt adds the cache
+# entries of the compiled buckets and the GPU they were compiled on, which do not change them.
+PROBED_KEYS = (
+    "alphafold3_version", "alphafold3_commit", "image_id", "jax", "jaxlib", "xla_backend", "xla_flags",
+    "gpu", "nvidia_driver", "model_weights_sha256", "model_flags", "buckets",
+)
+
+def environment_record(env):
+    """
+    The environment that predictions are recorded with in the predictions cache, as (env_hash,
+    JSON text), from probe_environment() or environment.txt. The hash is that of the text, which
+    holds only PROBED_KEYS, so that it is the same for every GPU of a model and every alphafold3_init.
+    """
+    text = json.dumps({key: env[key] for key in PROBED_KEYS}, sort_keys=True)
+    raw_hash = hashlib.sha256(text.encode()).digest()
+    return base64.urlsafe_b64encode(raw_hash).decode().rstrip("="), text
 
 def write_environment(env_path, env):
     with open(env_path, 'w') as f:

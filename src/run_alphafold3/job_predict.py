@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor as TPE
 from pathlib import Path
 from tqdm import tqdm
 
-from run_alphafold3.utils import NUM_SAMPLES, MEMORY_ENV, get_input_jsons, get_data_paths, get_cache_paths, fetch_pred, get_results_dir_path, get_results_files_paths, write_results, get_image_path, open_cache, container_cmd, model_flags, detect_compute_gpus
-from run_alphafold3.environment import probe_environment, read_environment, compare_environment, parse_compiled_buckets
+from run_alphafold3.utils import NUM_SAMPLES, MEMORY_ENV, get_input_jsons, get_data_paths, get_cache_paths, fetch_pred, get_results_dir_path, get_results_files_paths, write_results, get_image_path, open_cache, init_predictions_db, container_cmd, model_flags, detect_compute_gpus
+from run_alphafold3.environment import probe_environment, read_environment, compare_environment, parse_compiled_buckets, environment_record
 from run_alphafold3.model_cache import cache_keys
 from run_alphafold3.gpu_lock import gpu_lock, lock_fds, device_node, duration, GPUWaitTimeout, DEF_MAX_WAIT
 
@@ -194,6 +194,7 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
     if mismatches:
         error(f"The environment differs from the one recorded in {env_path}: re-run alphafold3_init", fatal=True)
     compiled = parse_compiled_buckets(recorded)
+    env_hash, env_text = environment_record(current)
     buckets = [int(b) for b in recorded["buckets"].split(',')]
 
     # Restore cached predictions, collect the rest
@@ -222,6 +223,11 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
 
     with get_log(log_file) as log, open_cache(pred_db_path, read_only_cache) as conn, tqdm(total=len(json_paths)) as progress_bar, tempfile.TemporaryDirectory() as links_dir:
         progress_bar.update(len(success_paths))
+        if not read_only_cache:
+            # Every new prediction records the environment it was made in
+            init_predictions_db(conn)
+            conn.execute("INSERT OR IGNORE INTO environments VALUES (?, ?)", (env_hash, env_text))
+            conn.commit()
 
         # Each bucket runs under the memory mode it was compiled with
         pending = {"normal": [], "unified": []}
@@ -310,7 +316,7 @@ def predict(json_paths, output_path, pred_db_path, model_path, cache_path, env_p
                 for json_path, json_hash, seed, sample, to_path in event:
                     cif_path, summ_path, conf_path = get_results_files_paths(to_path)
                     if not read_only_cache:
-                        conn.execute("INSERT OR IGNORE INTO predictions VALUES (?, ?, ?, ?, ?, ?)", (json_hash, seed, sample, cif_path.read_text(), summ_path.read_text(), conf_path.read_text()))
+                        conn.execute("INSERT OR IGNORE INTO predictions (json_hash, seed, sample, cif, summary, confidences, env_hash) VALUES (?, ?, ?, ?, ?, ?, ?)", (json_hash, seed, sample, cif_path.read_text(), summ_path.read_text(), conf_path.read_text(), env_hash))
                     seeds_left = remaining[str(json_path)]
                     seeds_left.discard(seed)
                     if not seeds_left and str(json_path) not in success_paths:
